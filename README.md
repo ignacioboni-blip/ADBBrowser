@@ -42,6 +42,24 @@ as the fallback path and for root probes.
 - **Root keyline**: browsing paths a plain adb shell can't reach (outside
   /sdcard and /storage) draws an amber keyline around the view and ignites the
   root badge — you always know when you're acting as superuser.
+- **Drag out to Finder**: drag any file from the list or grid straight into
+  Finder; it's pulled over adb when the drop lands.
+- **Cancellable transfer queue**: batches queue up serially; the status strip
+  shows progress, speed, an × to cancel, and how many batches are waiting.
+- **Overwrite protection**: paste, upload, and download prompt with
+  Replace / Keep Both / Skip when names collide (Keep Both auto-numbers
+  Finder-style).
+- **Get Info (⌘I)**: path, size (on-demand `du` for folders), modified time,
+  symlink target, and editable owner/group + rwx permission checkboxes with an
+  octal field. Note: chmod on /sdcard is a no-op — Android's emulated FUSE
+  filesystem forces its own permissions there; it works on real filesystems
+  like /data.
+- **Hot-plug detection**: `adb track-devices` runs in the background, so
+  plugging in or unplugging a phone updates the app within half a second.
+- **Instant revisits**: listings are cached per folder — going back shows the
+  cached list immediately while a silent refresh runs behind it.
+- **Folders-first + natural sort**: directories group on top (toggleable in
+  the ⋯ menu) and names sort Finder-style ("IMG_2" before "IMG_10").
 - **Root auto-detection** per device, shown in the status bar:
   1. adbd already running as root → plain commands
   2. `su -c` available (Magisk/KernelSU) → every command wrapped in su

@@ -24,8 +24,23 @@ struct ContentView: View {
     var body: some View {
         chrome
             .sheet(item: $sheet) { mode in sheetView(mode) }
+            .sheet(item: $model.infoFile) { file in
+                GetInfoSheet(file: file, model: model)
+            }
             .alert(item: $model.error) { err in
                 Alert(title: Text("adb Error"), message: Text(err.message), dismissButton: .default(Text("OK")))
+            }
+            .confirmationDialog(
+                model.conflictPrompt?.title ?? "Name conflicts",
+                isPresented: conflictShown
+            ) {
+                Button("Replace", role: .destructive) { resolveConflict(.replace) }
+                Button("Keep Both") { resolveConflict(.keepBoth) }
+                Button("Skip Conflicting") { resolveConflict(.skip) }
+                Button("Cancel", role: .cancel) { model.conflictPrompt = nil }
+            } message: {
+                Text((model.conflictPrompt?.names.prefix(6).joined(separator: ", ") ?? "")
+                     + ((model.conflictPrompt?.names.count ?? 0) > 6 ? ", …" : ""))
             }
             .confirmationDialog(
                 "Delete \(model.pendingDeletion.count) item(s) from the device?",
@@ -66,6 +81,19 @@ struct ContentView: View {
             get: { !model.pendingDeletion.isEmpty },
             set: { if !$0 { model.pendingDeletion = [] } }
         )
+    }
+
+    private var conflictShown: Binding<Bool> {
+        Binding(
+            get: { model.conflictPrompt != nil },
+            set: { if !$0 { model.conflictPrompt = nil } }
+        )
+    }
+
+    private func resolveConflict(_ resolution: ConflictResolution) {
+        guard let prompt = model.conflictPrompt else { return }
+        model.conflictPrompt = nil
+        prompt.resolve(resolution)
     }
 
     private var deletionSummary: String {
@@ -234,6 +262,7 @@ struct ContentView: View {
                     }
                 }
                 .padding(.vertical, compact ? 0 : 2)
+                .draggable(file)
             }
             .width(min: 200, ideal: 320)
 
@@ -292,6 +321,9 @@ struct ContentView: View {
                 Button("Quick Look") { model.quickLook(files) }
             }
             Button("Download to Mac…") { model.download(files) }
+            if files.count == 1, let f = files.first {
+                Button("Get Info…") { model.infoFile = f }
+            }
             Divider()
             Button("Copy") { model.copyToClipboard(files, cut: false) }
             Button("Cut (Move)") { model.copyToClipboard(files, cut: true) }
@@ -382,6 +414,7 @@ struct ContentView: View {
                 Button("Upload Files Here…") { model.uploadViaPanel() }
                 Divider()
                 Toggle("Show Hidden Files", isOn: $model.showHidden)
+                Toggle("Folders First", isOn: $model.foldersFirst)
                 Picker("Density", selection: $model.density) {
                     ForEach(Density.allCases, id: \.self) { d in
                         Text(d.label).tag(d)
@@ -420,6 +453,18 @@ struct ContentView: View {
                 }
                 if let counter = transfer.counter {
                     Text(counter).foregroundStyle(.tertiary)
+                }
+                Button {
+                    model.cancelCurrentTransfer()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Cancel this transfer")
+                if model.queuedTransferCount > 0 {
+                    Text("+\(model.queuedTransferCount) queued")
+                        .foregroundStyle(.tertiary)
                 }
             } else if model.isBusy {
                 ProgressView().controlSize(.small)

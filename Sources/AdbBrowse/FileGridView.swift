@@ -84,6 +84,7 @@ struct FileGridView: View {
                 .strokeBorder(isSelected ? model.accent.opacity(0.6) : Color.clear, lineWidth: 1.5)
         )
         .contentShape(Rectangle())
+        .draggable(file)
         .gesture(TapGesture(count: 2).onEnded { model.activate(file) })
         .simultaneousGesture(TapGesture().onEnded {
             if NSEvent.modifierFlags.contains(.command) {

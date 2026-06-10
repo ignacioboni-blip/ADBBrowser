@@ -62,59 +62,71 @@ final class AdbClient: Sendable {
 
     private func runRaw(_ arguments: [String], timeout: TimeInterval) async throws -> RawResult {
         let adbPath = self.adbPath
-        return try await withCheckedThrowingContinuation { continuation in
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: adbPath)
-            process.arguments = arguments
+        let box = ProcessBox()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                if box.isCancelled {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: adbPath)
+                process.arguments = arguments
 
-            let outPipe = Pipe()
-            let errPipe = Pipe()
-            process.standardOutput = outPipe
-            process.standardError = errPipe
+                let outPipe = Pipe()
+                let errPipe = Pipe()
+                process.standardOutput = outPipe
+                process.standardError = errPipe
 
-            let group = DispatchGroup()
-            var outData = Data()
-            var errData = Data()
+                let group = DispatchGroup()
+                var outData = Data()
+                var errData = Data()
 
-            group.enter()
-            DispatchQueue.global().async {
-                outData = outPipe.fileHandleForReading.readDataToEndOfFile()
-                group.leave()
-            }
-            group.enter()
-            DispatchQueue.global().async {
-                errData = errPipe.fileHandleForReading.readDataToEndOfFile()
-                group.leave()
-            }
+                group.enter()
+                DispatchQueue.global().async {
+                    outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+                    group.leave()
+                }
+                group.enter()
+                DispatchQueue.global().async {
+                    errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+                    group.leave()
+                }
 
-            do {
-                try process.run()
-            } catch {
-                continuation.resume(throwing: AdbError(message: "Could not launch adb: \(error.localizedDescription)"))
-                return
-            }
+                do {
+                    try process.run()
+                } catch {
+                    continuation.resume(throwing: AdbError(message: "Could not launch adb: \(error.localizedDescription)"))
+                    return
+                }
+                box.attach(process)
 
-            let timedOut = LockedFlag()
-            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
-                if process.isRunning {
-                    timedOut.set()
-                    process.terminate()
+                let timedOut = LockedFlag()
+                DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
+                    if process.isRunning {
+                        timedOut.set()
+                        process.terminate()
+                    }
+                }
+
+                DispatchQueue.global().async {
+                    process.waitUntilExit()
+                    group.wait()
+                    if box.isCancelled {
+                        continuation.resume(throwing: CancellationError())
+                    } else if timedOut.value {
+                        continuation.resume(throwing: AdbError(message: "adb command timed out: adb \(arguments.joined(separator: " "))"))
+                    } else {
+                        continuation.resume(returning: RawResult(
+                            stdout: outData,
+                            stderr: errData,
+                            exitCode: process.terminationStatus
+                        ))
+                    }
                 }
             }
-
-            DispatchQueue.global().async {
-                process.waitUntilExit()
-                group.wait()
-                if timedOut.value {
-                    continuation.resume(throwing: AdbError(message: "adb command timed out: adb \(arguments.joined(separator: " "))"))
-                } else {
-                    continuation.resume(returning: RawResult(
-                        stdout: outData,
-                        stderr: errData,
-                        exitCode: process.terminationStatus
-                    ))
-                }
-            }
+        } onCancel: {
+            box.cancel()
         }
     }
 
@@ -307,13 +319,69 @@ final class AdbClient: Sendable {
         guard r.ok else { throw AdbError(message: r.combinedError.isEmpty ? "Command failed: \(command)" : r.combinedError) }
     }
 
+    // MARK: file metadata (Get Info)
+
+    func chmod(_ octal: String, path: String, serial: String, su: Bool) async throws {
+        try await runOrThrow("chmod \(octal) \(Self.quote(path))", serial: serial, su: su)
+    }
+
+    func chown(_ ownerGroup: String, path: String, serial: String, su: Bool) async throws {
+        try await runOrThrow("chown \(Self.quote(ownerGroup)) \(Self.quote(path))", serial: serial, su: su)
+    }
+
+    /// Total size of a file or folder tree (`du -sk`).
+    func sizeOf(path: String, serial: String, su: Bool) async -> Int64? {
+        let target = path.hasSuffix("/") ? path : path + "/"
+        guard let r = try? await shell("du -sk \(Self.quote(target))", serial: serial, su: su, timeout: 300),
+              let kb = Int64(r.stdout.split(separator: "\t").first?
+                  .trimmingCharacters(in: .whitespaces) ?? "") else { return nil }
+        return kb * 1024
+    }
+
+    // MARK: device hot-plug tracking
+
+    /// Long-lived `adb track-devices`: yields whenever the device list
+    /// changes, finishes when the tracker dies (caller restarts it).
+    func deviceEvents() -> AsyncStream<Void> {
+        let adbPath = self.adbPath
+        return AsyncStream { continuation in
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: adbPath)
+            process.arguments = ["track-devices"]
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            process.standardError = Pipe()
+
+            pipe.fileHandleForReading.readabilityHandler = { handle in
+                if handle.availableData.isEmpty {
+                    handle.readabilityHandler = nil
+                    continuation.finish()
+                } else {
+                    continuation.yield(())
+                }
+            }
+            process.terminationHandler = { _ in continuation.finish() }
+            continuation.onTermination = { _ in
+                if process.isRunning { process.terminate() }
+            }
+            do {
+                try process.run()
+            } catch {
+                continuation.finish()
+            }
+        }
+    }
+
     // MARK: pull / push (with su staging fallback)
 
-    /// Pull `remotePath` into local directory `localDir`. If adbd can't read the
+    /// Pull `remotePath` to `localDir/destName`. If adbd can't read the
     /// path (su-only root), stage a copy in /data/local/tmp first.
-    func pull(remotePath: String, fileName: String, toLocalDir localDir: URL, serial: String, suAvailable: Bool) async throws {
-        let direct = try await run(["-s", serial, "pull", remotePath, localDir.path], timeout: 3600)
+    func pull(remotePath: String, fileName: String, destName: String? = nil,
+              toLocalDir localDir: URL, serial: String, suAvailable: Bool) async throws {
+        let target = localDir.appendingPathComponent(destName ?? fileName).path
+        let direct = try await run(["-s", serial, "pull", remotePath, target], timeout: 3600)
         if direct.ok { return }
+        try Task.checkCancellation()
         guard suAvailable else {
             throw AdbError(message: "Pull failed: \(direct.combinedError)")
         }
@@ -323,7 +391,7 @@ final class AdbClient: Sendable {
         do {
             try await runOrThrow("mkdir -p \(q(stage)) && cp -a \(q(remotePath)) \(q(stage + "/")) && chmod -R a+rX \(q(stage))",
                                  serial: serial, su: true, timeout: 3600)
-            let staged = try await run(["-s", serial, "pull", stage + "/" + fileName, localDir.path], timeout: 3600)
+            let staged = try await run(["-s", serial, "pull", stage + "/" + fileName, target], timeout: 3600)
             guard staged.ok else { throw AdbError(message: "Pull failed: \(staged.combinedError)") }
         } catch {
             _ = try? await shell("rm -rf \(q(stage))", serial: serial, su: true)
@@ -332,14 +400,16 @@ final class AdbClient: Sendable {
         _ = try? await shell("rm -rf \(q(stage))", serial: serial, su: true)
     }
 
-    /// Push a local file/folder into `remoteDir`. If adbd can't write there
-    /// (su-only root), push to /data/local/tmp and `su mv` into place.
-    func push(localURL: URL, toRemoteDir remoteDir: String, serial: String, suAvailable: Bool) async throws {
-        let name = localURL.lastPathComponent
+    /// Push a local file/folder to `remoteDir/destName`. If adbd can't write
+    /// there (su-only root), push to /data/local/tmp and `su mv` into place.
+    func push(localURL: URL, toRemoteDir remoteDir: String, destName: String? = nil,
+              serial: String, suAvailable: Bool) async throws {
+        let name = destName ?? localURL.lastPathComponent
         let dest = remoteDir == "/" ? "/" + name : remoteDir + "/" + name
 
         let direct = try await run(["-s", serial, "push", localURL.path, dest], timeout: 3600)
         if direct.ok { return }
+        try Task.checkCancellation()
         guard suAvailable else {
             throw AdbError(message: "Push failed: \(direct.combinedError)")
         }
@@ -363,4 +433,29 @@ private final class LockedFlag: @unchecked Sendable {
     private var flag = false
     var value: Bool { lock.lock(); defer { lock.unlock() }; return flag }
     func set() { lock.lock(); flag = true; lock.unlock() }
+}
+
+/// Bridges Task cancellation to Process termination.
+private final class ProcessBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var process: Process?
+    private var cancelled = false
+
+    var isCancelled: Bool { lock.lock(); defer { lock.unlock() }; return cancelled }
+
+    func attach(_ p: Process) {
+        lock.lock()
+        process = p
+        let wasCancelled = cancelled
+        lock.unlock()
+        if wasCancelled { p.terminate() }
+    }
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        let p = process
+        lock.unlock()
+        if let p, p.isRunning { p.terminate() }
+    }
 }

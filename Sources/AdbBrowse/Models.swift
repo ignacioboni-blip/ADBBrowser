@@ -1,4 +1,6 @@
+import CoreTransferable
 import Foundation
+import UniformTypeIdentifiers
 
 // MARK: - Devices
 
@@ -183,4 +185,23 @@ struct AdbError: LocalizedError, Identifiable {
     let id = UUID()
     let message: String
     var errorDescription: String? { message }
+}
+
+// MARK: - Drag out to Finder
+
+/// FileRepresentation needs a static export closure; the view model installs
+/// one that pulls the file over adb when a drag is dropped in Finder.
+enum DragExport {
+    nonisolated(unsafe) static var handler: (@Sendable (RemoteFile) async throws -> URL)?
+}
+
+extension RemoteFile: Transferable {
+    static var transferRepresentation: some TransferRepresentation {
+        FileRepresentation(exportedContentType: .item) { file in
+            guard let handler = DragExport.handler else {
+                throw AdbError(message: "No device connected")
+            }
+            return SentTransferredFile(try await handler(file), allowAccessingOriginalFile: true)
+        }
+    }
 }

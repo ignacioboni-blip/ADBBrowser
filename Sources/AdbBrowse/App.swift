@@ -33,6 +33,10 @@ struct AdbBrowseApp: App {
                     model.filterFocusRequest &+= 1
                 }
                 .keyboardShortcut("f")
+                Button("Get Info") {
+                    model.infoFile = model.selectedFiles.first
+                }
+                .keyboardShortcut("i")
                 Divider()
                 Button("View as List") { model.viewMode = .list }
                     .keyboardShortcut("1")

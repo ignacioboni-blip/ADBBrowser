@@ -19,6 +19,50 @@ enum NavDirection {
     case forward, backward
 }
 
+// MARK: - Conflicts
+
+enum ConflictResolution {
+    case replace, keepBoth, skip
+}
+
+struct ConflictPrompt: Identifiable {
+    let id = UUID()
+    let title: String
+    let names: [String]
+    let resolve: (ConflictResolution) -> Void
+}
+
+// MARK: - Transfer queue
+
+enum TransferCompletion {
+    case revealInFinder, open, quickLook, none
+}
+
+struct PullItem {
+    let file: RemoteFile
+    let destName: String
+}
+
+struct PushItem {
+    let url: URL
+    let destName: String
+    let deleteFirst: Bool
+}
+
+struct TransferBatch: Identifiable {
+    enum Kind {
+        case pull(items: [PullItem], dest: URL, completion: TransferCompletion)
+        case push(items: [PushItem], destDir: String)
+    }
+    let id = UUID()
+    let kind: Kind
+
+    var isUpload: Bool {
+        if case .push = kind { return true }
+        return false
+    }
+}
+
 @MainActor
 final class BrowserViewModel: ObservableObject {
     static let places: [(name: String, icon: String, path: String)] = [
@@ -55,13 +99,19 @@ final class BrowserViewModel: ObservableObject {
     @Published var sortOrder = [KeyPathComparator(\RemoteFile.name)] {
         didSet { resort() }
     }
-    /// Sorted once per change, not on every render — filtering stays O(n).
     private var sortedEntries: [RemoteFile] = []
     private var lastListingFailed = false
+    private var listingCache: [String: [RemoteFile]] = [:]
     @Published var filterText = ""
     @Published var filterFocusRequest = 0
     @Published var showHidden = UserDefaults.standard.bool(forKey: "showHidden") {
         didSet { UserDefaults.standard.set(showHidden, forKey: "showHidden") }
+    }
+    @Published var foldersFirst = (UserDefaults.standard.object(forKey: "foldersFirst") as? Bool) ?? true {
+        didSet {
+            UserDefaults.standard.set(foldersFirst, forKey: "foldersFirst")
+            resort()
+        }
     }
 
     // Presentation
@@ -80,6 +130,7 @@ final class BrowserViewModel: ObservableObject {
     @Published var isMeasuring = false
     @Published private(set) var flightTrigger = 0
     @Published private(set) var flightIsUpload = false
+    @Published var infoFile: RemoteFile?
     private var usageCache: [String: UsageNode] = [:]
 
     // Activity / errors
@@ -87,7 +138,12 @@ final class BrowserViewModel: ObservableObject {
     @Published var statusMessage = ""
     @Published var error: AdbError?
     @Published var pendingDeletion: [RemoteFile] = []
+    @Published var conflictPrompt: ConflictPrompt?
+
+    // Transfer queue
     @Published var activeTransfer: TransferProgress?
+    @Published private(set) var transferBatches: [TransferBatch] = []
+    private var batchWorker: Task<Void, Never>?
 
     // Internal clipboard for device-side copy/move
     @Published private(set) var clipboardPaths: [String] = []
@@ -96,6 +152,8 @@ final class BrowserViewModel: ObservableObject {
     private var backStack: [String] = []
     private var forwardStack: [String] = []
     private var pollTask: Task<Void, Never>?
+    private var trackTask: Task<Void, Never>?
+    private var deviceRefreshDebounce: Task<Void, Never>?
 
     var client: AdbClient?
 
@@ -106,6 +164,7 @@ final class BrowserViewModel: ObservableObject {
     var canPaste: Bool { !clipboardPaths.isEmpty }
     var useSu: Bool { rootMode == .su }
     var suAvailable: Bool { rootMode == .su || rootMode == .adbdRoot }
+    var queuedTransferCount: Int { max(0, transferBatches.count - 1) }
 
     /// True when browsing paths a plain adb shell couldn't reach —
     /// the UI shows an amber keyline as a "you are superuser here" signal.
@@ -116,7 +175,20 @@ final class BrowserViewModel: ObservableObject {
     }
 
     private func resort() {
-        sortedEntries = entries.sorted(using: sortOrder)
+        var list: [RemoteFile]
+        // Finder-style natural ordering for names ("IMG_2" before "IMG_10").
+        if let primary = sortOrder.first, primary.keyPath == \RemoteFile.name {
+            list = entries.sorted {
+                let r = $0.name.localizedStandardCompare($1.name)
+                return primary.order == .forward ? r == .orderedAscending : r == .orderedDescending
+            }
+        } else {
+            list = entries.sorted(using: sortOrder)
+        }
+        if foldersFirst {
+            list = list.filter(\.isDirectory) + list.filter { !$0.isDirectory }
+        }
+        sortedEntries = list
     }
 
     var visibleEntries: [RemoteFile] {
@@ -144,6 +216,7 @@ final class BrowserViewModel: ObservableObject {
 
     deinit {
         pollTask?.cancel()
+        trackTask?.cancel()
     }
 
     // MARK: - Setup
@@ -154,21 +227,26 @@ final class BrowserViewModel: ObservableObject {
             return
         }
         adbAvailable = true
-        client = AdbClient(adbPath: path)
+        let client = AdbClient(adbPath: path)
+        self.client = client
+        DragExport.handler = { [weak self] file in
+            guard let self else { throw AdbError(message: "App is shutting down") }
+            return try await self.exportForDrag(file)
+        }
         if selectedSerial == nil,
            let start = UserDefaults.standard.string(forKey: "defaultPath"),
            !start.isEmpty {
             currentPath = normalize(start)
             pathFieldText = currentPath
         }
+        startDeviceTracking(client: client)
         refreshDevices()
     }
 
-    func refreshDevices() {
+    func refreshDevices(quiet: Bool = false) {
         guard let client else { return }
         Task {
-            await withStatus("Looking for devices…") {
-                let found = try await client.listDevices()
+            let apply = { (found: [DeviceInfo]) in
                 self.devices = found
                 if let current = self.selectedSerial, !found.contains(where: { $0.serial == current && $0.isUsable }) {
                     self.selectedSerial = nil
@@ -176,6 +254,33 @@ final class BrowserViewModel: ObservableObject {
                 if self.selectedSerial == nil, let first = found.first(where: { $0.isUsable }) {
                     self.selectedSerial = first.serial
                 }
+            }
+            if quiet {
+                if let found = try? await client.listDevices() { apply(found) }
+            } else {
+                await withStatus("Looking for devices…") {
+                    apply(try await client.listDevices())
+                }
+            }
+        }
+    }
+
+    /// adb track-devices: refresh the device list the moment something
+    /// plugs in or drops off, no manual refresh needed.
+    private func startDeviceTracking(client: AdbClient) {
+        trackTask?.cancel()
+        trackTask = Task { [weak self] in
+            while !Task.isCancelled {
+                for await _ in client.deviceEvents() {
+                    guard let self else { return }
+                    self.deviceRefreshDebounce?.cancel()
+                    self.deviceRefreshDebounce = Task { [weak self] in
+                        try? await Task.sleep(for: .milliseconds(400))
+                        guard !Task.isCancelled else { return }
+                        self?.refreshDevices(quiet: true)
+                    }
+                }
+                try? await Task.sleep(for: .seconds(3))
             }
         }
     }
@@ -190,6 +295,7 @@ final class BrowserViewModel: ObservableObject {
         rootMode = .unknown
         backStack = []
         forwardStack = []
+        listingCache.removeAll()
         startPolling(client: client, serial: serial)
         Task {
             // Root detection and the first listing race in parallel — /sdcard
@@ -208,7 +314,6 @@ final class BrowserViewModel: ObservableObject {
     private func startPolling(client: AdbClient, serial: String) {
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
-                // Battery / storage / Material You seed
                 let status = await client.fetchStatus(serial: serial)
                 guard let self, !Task.isCancelled else { return }
                 self.deviceStatus = status
@@ -252,7 +357,6 @@ final class BrowserViewModel: ObservableObject {
         navigate(to: parent.isEmpty ? "/" : parent, direction: .backward)
     }
 
-    /// Change the path with a zoom transition: forward zooms in, backward zooms out.
     private func setPath(_ path: String, direction: NavDirection) {
         navDirection = direction
         withAnimation(.spring(response: 0.32, dampingFraction: 0.85)) {
@@ -262,6 +366,7 @@ final class BrowserViewModel: ObservableObject {
     }
 
     func reload() {
+        invalidateListing()
         Task { await loadCurrentPath() }
     }
 
@@ -285,28 +390,68 @@ final class BrowserViewModel: ObservableObject {
         }
     }
 
-    /// Set before navigation to select an item once the listing arrives
-    /// (used by command-palette search results).
+    /// Set before navigation to select an item once the listing arrives.
     var pendingSelection: String?
+
+    private func cacheKey(_ path: String) -> String {
+        "\(selectedSerial ?? "-")|\(path)"
+    }
+
+    private func invalidateListing(_ path: String? = nil) {
+        if let path {
+            listingCache[cacheKey(path)] = nil
+        } else {
+            listingCache[cacheKey(currentPath)] = nil
+        }
+    }
 
     private func loadCurrentPath() async {
         guard let client, let serial = selectedSerial else { return }
-        pathFieldText = currentPath
+        let path = currentPath
+        let key = cacheKey(path)
+        pathFieldText = path
         lastListingFailed = false
-        await withStatus("Loading \(currentPath)…") {
+
+        // Instant render from cache, then refresh silently in the background.
+        if let cached = listingCache[key] {
+            entries = cached
+            applySelectionAfterLoad()
             do {
-                self.entries = try await client.list(path: self.currentPath, serial: serial, su: self.useSu)
+                let fresh = try await client.list(path: path, serial: serial, su: useSu)
+                storeListing(fresh, key: key, path: path)
+            } catch let e as AdbError {
+                lastListingFailed = true
+                error = e
+            } catch {}
+            return
+        }
+
+        await withStatus("Loading \(path)…") {
+            do {
+                let fresh = try await client.list(path: path, serial: serial, su: self.useSu)
+                self.storeListing(fresh, key: key, path: path)
             } catch {
                 self.lastListingFailed = true
                 throw error
             }
-            if let pending = self.pendingSelection {
-                self.selection = self.entries.contains(where: { $0.id == pending }) ? [pending] : []
-                self.pendingSelection = nil
-            } else {
-                self.selection = []
-            }
-            self.addRecent(self.currentPath)
+        }
+    }
+
+    private func storeListing(_ fresh: [RemoteFile], key: String, path: String) {
+        if listingCache.count > 80 { listingCache.removeAll() }
+        listingCache[key] = fresh
+        guard currentPath == path else { return }
+        entries = fresh
+        applySelectionAfterLoad()
+        addRecent(path)
+    }
+
+    private func applySelectionAfterLoad() {
+        if let pending = pendingSelection {
+            selection = entries.contains(where: { $0.id == pending }) ? [pending] : []
+            pendingSelection = nil
+        } else {
+            selection = selection.filter { id in entries.contains(where: { $0.id == id }) }
         }
     }
 
@@ -334,6 +479,7 @@ final class BrowserViewModel: ObservableObject {
             await withStatus("Creating folder…") {
                 try await client.makeDirectory(path: path, serial: serial, su: self.useSu)
             }
+            invalidateListing()
             await loadCurrentPath()
         }
     }
@@ -345,6 +491,7 @@ final class BrowserViewModel: ObservableObject {
             await withStatus("Renaming…") {
                 try await client.move(from: file.path, to: dest, serial: serial, su: self.useSu)
             }
+            invalidateListing()
             await loadCurrentPath()
         }
     }
@@ -364,6 +511,7 @@ final class BrowserViewModel: ObservableObject {
                     try await client.delete(path: f.path, serial: serial, su: self.useSu)
                 }
             }
+            invalidateListing()
             await loadCurrentPath()
         }
     }
@@ -375,26 +523,61 @@ final class BrowserViewModel: ObservableObject {
     }
 
     func paste() {
-        guard let client, let serial = selectedSerial, !clipboardPaths.isEmpty else { return }
-        let paths = clipboardPaths
+        guard selectedSerial != nil, !clipboardPaths.isEmpty else { return }
+        let sources = clipboardPaths
         let isCut = clipboardIsCut
         let dest = currentPath
+        let existing = Set(entries.map(\.name))
+        let conflicts = sources.map { ($0 as NSString).lastPathComponent }.filter { existing.contains($0) }
         if isCut { clipboardPaths = [] }
-        Task {
-            await withStatus("\(isCut ? "Moving" : "Copying") \(paths.count) item(s)…") {
-                for src in paths {
-                    if isCut {
-                        try await client.move(from: src, to: dest + "/", serial: serial, su: self.useSu)
-                    } else {
-                        try await client.copy(from: src, to: dest + "/", serial: serial, su: self.useSu)
-                    }
-                }
-            }
-            await loadCurrentPath()
+
+        let proceed: (ConflictResolution?) -> Void = { resolution in
+            Task { await self.performPaste(sources: sources, isCut: isCut, dest: dest,
+                                           existing: existing, resolution: resolution) }
+        }
+        if conflicts.isEmpty {
+            proceed(nil)
+        } else {
+            conflictPrompt = ConflictPrompt(
+                title: "\(conflicts.count) item(s) already exist in \((dest as NSString).lastPathComponent.isEmpty ? dest : (dest as NSString).lastPathComponent)",
+                names: conflicts.sorted(),
+                resolve: proceed
+            )
         }
     }
 
-    // MARK: - Transfers
+    private func performPaste(sources: [String], isCut: Bool, dest: String,
+                              existing: Set<String>, resolution: ConflictResolution?) async {
+        guard let client, let serial = selectedSerial else { return }
+        var taken = existing
+        await withStatus("\(isCut ? "Moving" : "Copying") \(sources.count) item(s)…") {
+            for src in sources {
+                let name = (src as NSString).lastPathComponent
+                var targetName = name
+                if existing.contains(name) {
+                    switch resolution {
+                    case .skip, nil:
+                        continue
+                    case .replace:
+                        try await client.delete(path: self.join(dest, name), serial: serial, su: self.useSu)
+                    case .keepBoth:
+                        targetName = Self.availableName(name, existing: taken)
+                    }
+                }
+                taken.insert(targetName)
+                let target = self.join(dest, targetName)
+                if isCut {
+                    try await client.move(from: src, to: target, serial: serial, su: self.useSu)
+                } else {
+                    try await client.copy(from: src, to: target, serial: serial, su: self.useSu)
+                }
+            }
+        }
+        invalidateListing(dest)
+        await loadCurrentPath()
+    }
+
+    // MARK: - Transfers (queued, cancellable)
 
     func download(_ files: [RemoteFile]) {
         guard !files.isEmpty else { return }
@@ -405,118 +588,52 @@ final class BrowserViewModel: ObservableObject {
         panel.prompt = "Download Here"
         panel.message = "Choose where to save \(files.count) item(s) from the device"
         guard panel.runModal() == .OK, let dir = panel.url else { return }
-        transfer(files, to: dir, completion: .revealInFinder)
+
+        let existing = Set((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? [])
+        let conflicts = files.map(\.name).filter { existing.contains($0) }
+
+        let proceed: (ConflictResolution?) -> Void = { resolution in
+            var taken = existing
+            var items: [PullItem] = []
+            for f in files {
+                var destName = f.name
+                if existing.contains(f.name) {
+                    switch resolution {
+                    case .skip, nil: continue
+                    case .replace:
+                        try? FileManager.default.removeItem(at: dir.appendingPathComponent(f.name))
+                    case .keepBoth:
+                        destName = Self.availableName(f.name, existing: taken)
+                    }
+                }
+                taken.insert(destName)
+                items.append(PullItem(file: f, destName: destName))
+            }
+            guard !items.isEmpty else { return }
+            self.enqueue(TransferBatch(kind: .pull(items: items, dest: dir, completion: .revealInFinder)))
+        }
+
+        if conflicts.isEmpty {
+            proceed(nil)
+        } else {
+            conflictPrompt = ConflictPrompt(
+                title: "\(conflicts.count) item(s) already exist in \(dir.lastPathComponent)",
+                names: conflicts.sorted(),
+                resolve: proceed
+            )
+        }
     }
 
     func downloadAndOpen(_ file: RemoteFile) {
-        transfer([file], to: Self.makeTempDir(), completion: .open)
+        enqueue(TransferBatch(kind: .pull(items: [PullItem(file: file, destName: file.name)],
+                                          dest: Self.makeTempDir(), completion: .open)))
     }
 
-    /// Pull the files to a temp folder, then show them in Quick Look.
     func quickLook(_ files: [RemoteFile]) {
         let pullable = files.filter { $0.type == .file }
         guard !pullable.isEmpty else { return }
-        transfer(pullable, to: Self.makeTempDir(), completion: .quickLook)
-    }
-
-    private static func makeTempDir() -> URL {
-        let tmp = FileManager.default.temporaryDirectory
-            .appendingPathComponent("AdbBrowse", isDirectory: true)
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        try? FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
-        return tmp
-    }
-
-    private enum TransferCompletion {
-        case revealInFinder, open, quickLook
-    }
-
-    private func transfer(_ files: [RemoteFile], to dir: URL, completion: TransferCompletion) {
-        guard let client, let serial = selectedSerial else { return }
-        let suAvailable = self.suAvailable
-        flightIsUpload = false
-        flightTrigger &+= 1
-        Task {
-            await withStatus("Pulling \(files.count) item(s)…") {
-                for (i, f) in files.enumerated() {
-                    let local = dir.appendingPathComponent(f.name)
-                    let monitor = self.startPullMonitor(file: f, localURL: local, index: i + 1, total: files.count)
-                    defer { monitor.cancel() }
-                    try await client.pull(remotePath: f.path, fileName: f.name,
-                                          toLocalDir: dir, serial: serial, suAvailable: suAvailable)
-                }
-                let locals = files.map { dir.appendingPathComponent($0.name) }
-                switch completion {
-                case .open:
-                    if let first = locals.first { NSWorkspace.shared.open(first) }
-                case .revealInFinder:
-                    NSWorkspace.shared.activateFileViewerSelecting(locals)
-                case .quickLook:
-                    self.quickLookItems = locals
-                    self.quickLookItem = locals.first
-                }
-            }
-        }
-    }
-
-    // MARK: - Thumbnails & search
-
-    private let thumbnails = ThumbnailStore()
-
-    func thumbnail(for file: RemoteFile) async -> NSImage? {
-        guard let client, let serial = selectedSerial else { return nil }
-        return await thumbnails.thumbnail(for: file, client: client, serial: serial, suAvailable: suAvailable)
-    }
-
-    /// Recursive find under the current folder (used by the command palette).
-    func searchDevice(_ query: String) async -> [String] {
-        guard let client, let serial = selectedSerial else { return [] }
-        return await client.find(query: query, under: currentPath, serial: serial, su: useSu)
-    }
-
-    func revealSearchResult(_ path: String) {
-        let parent = (path as NSString).deletingLastPathComponent
-        pendingSelection = path
-        navigate(to: parent.isEmpty ? "/" : parent)
-    }
-
-    // MARK: - Storage sunburst
-
-    func loadUsage(force: Bool = false) {
-        guard let client, let serial = selectedSerial else { return }
-        let path = currentPath
-        let key = serial + ":" + path
-        if !force, let cached = usageCache[key] {
-            usageTree = cached
-            return
-        }
-        usageTree = nil
-        isMeasuring = true
-        Task {
-            do {
-                let entries = try await client.diskUsage(path: path, serial: serial, su: useSu)
-                if self.currentPath == path, let tree = UsageNode.build(root: path, entries: entries) {
-                    self.usageCache[key] = tree
-                    self.usageTree = tree
-                }
-            } catch let e as AdbError {
-                self.error = e
-            } catch {}
-            self.isMeasuring = false
-        }
-    }
-
-    /// Sunburst wedges can be files or folders — du doesn't say which,
-    /// so check before deciding to descend or reveal.
-    func openFromSunburst(_ path: String) {
-        guard let client, let serial = selectedSerial else { return }
-        Task {
-            if await client.isDirectory(path: path, serial: serial, su: self.useSu) {
-                self.navigate(to: path)
-            } else {
-                self.revealSearchResult(path)
-            }
-        }
+        let items = pullable.map { PullItem(file: $0, destName: $0.name) }
+        enqueue(TransferBatch(kind: .pull(items: items, dest: Self.makeTempDir(), completion: .quickLook)))
     }
 
     func uploadViaPanel() {
@@ -531,22 +648,169 @@ final class BrowserViewModel: ObservableObject {
     }
 
     func upload(urls: [URL]) {
-        guard let client, let serial = selectedSerial, !urls.isEmpty else { return }
+        guard selectedSerial != nil, !urls.isEmpty else { return }
         let dest = currentPath
-        let suAvailable = self.suAvailable
-        flightIsUpload = true
+        let existing = Set(entries.map(\.name))
+        let conflicts = urls.map(\.lastPathComponent).filter { existing.contains($0) }
+
+        let proceed: (ConflictResolution?) -> Void = { resolution in
+            var taken = existing
+            var items: [PushItem] = []
+            for url in urls {
+                let name = url.lastPathComponent
+                var destName = name
+                var deleteFirst = false
+                if existing.contains(name) {
+                    switch resolution {
+                    case .skip, nil: continue
+                    case .replace: deleteFirst = true
+                    case .keepBoth: destName = Self.availableName(name, existing: taken)
+                    }
+                }
+                taken.insert(destName)
+                items.append(PushItem(url: url, destName: destName, deleteFirst: deleteFirst))
+            }
+            guard !items.isEmpty else { return }
+            self.enqueue(TransferBatch(kind: .push(items: items, destDir: dest)))
+        }
+
+        if conflicts.isEmpty {
+            proceed(nil)
+        } else {
+            conflictPrompt = ConflictPrompt(
+                title: "\(conflicts.count) item(s) already exist in this folder",
+                names: conflicts.sorted(),
+                resolve: proceed
+            )
+        }
+    }
+
+    /// Pull a file for a drag that landed in Finder.
+    private func exportForDrag(_ file: RemoteFile) async throws -> URL {
+        guard let client, let serial = selectedSerial else {
+            throw AdbError(message: "No device connected")
+        }
+        let dir = Self.makeTempDir()
+        statusMessage = "Exporting \(file.name)…"
+        defer { statusMessage = "" }
+        try await client.pull(remotePath: file.path, fileName: file.name,
+                              toLocalDir: dir, serial: serial, suAvailable: suAvailable)
+        return dir.appendingPathComponent(file.name)
+    }
+
+    private static func makeTempDir() -> URL {
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AdbBrowse", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try? FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        return tmp
+    }
+
+    static func availableName(_ name: String, existing: Set<String>) -> String {
+        guard existing.contains(name) else { return name }
+        let ext = (name as NSString).pathExtension
+        let base = (name as NSString).deletingPathExtension
+        var i = 2
+        while true {
+            let candidate = ext.isEmpty ? "\(base) \(i)" : "\(base) \(i).\(ext)"
+            if !existing.contains(candidate) { return candidate }
+            i += 1
+        }
+    }
+
+    private func join(_ dir: String, _ name: String) -> String {
+        dir == "/" ? "/" + name : dir + "/" + name
+    }
+
+    // MARK: queue machinery
+
+    private func enqueue(_ batch: TransferBatch) {
+        transferBatches.append(batch)
+        flightIsUpload = batch.isUpload
         flightTrigger &+= 1
-        Task {
-            await withStatus("Pushing \(urls.count) item(s)…") {
-                for (i, url) in urls.enumerated() {
-                    let remote = dest == "/" ? "/" + url.lastPathComponent : dest + "/" + url.lastPathComponent
-                    let monitor = self.startPushMonitor(localURL: url, remotePath: remote,
-                                                        index: i + 1, total: urls.count)
-                    defer { monitor.cancel() }
-                    try await client.push(localURL: url, toRemoteDir: dest, serial: serial, suAvailable: suAvailable)
+        pumpTransfers()
+    }
+
+    func cancelCurrentTransfer() {
+        batchWorker?.cancel()
+    }
+
+    private func pumpTransfers() {
+        guard batchWorker == nil, let batch = transferBatches.first else { return }
+        batchWorker = Task {
+            await self.run(batch: batch)
+            self.transferBatches.removeAll { $0.id == batch.id }
+            self.activeTransfer = nil
+            self.batchWorker = nil
+            self.pumpTransfers()
+        }
+    }
+
+    private func run(batch: TransferBatch) async {
+        guard let client, let serial = selectedSerial else { return }
+        let suAvailable = self.suAvailable
+
+        switch batch.kind {
+        case .pull(let items, let dest, let completion):
+            var completed: [URL] = []
+            for (i, item) in items.enumerated() {
+                let local = dest.appendingPathComponent(item.destName)
+                let monitor = startPullMonitor(file: item.file, localURL: local, index: i + 1, total: items.count)
+                do {
+                    try await client.pull(remotePath: item.file.path, fileName: item.file.name,
+                                          destName: item.destName, toLocalDir: dest,
+                                          serial: serial, suAvailable: suAvailable)
+                    monitor.cancel()
+                    completed.append(local)
+                } catch is CancellationError {
+                    monitor.cancel()
+                    try? FileManager.default.removeItem(at: local)
+                    statusMessage = "Transfer cancelled"
+                    return
+                } catch {
+                    monitor.cancel()
+                    self.error = AdbError(message: "Pulling \(item.file.name) failed: \((error as? AdbError)?.message ?? error.localizedDescription)")
+                    return
                 }
             }
-            await loadCurrentPath()
+            switch completion {
+            case .open:
+                if let first = completed.first { NSWorkspace.shared.open(first) }
+            case .revealInFinder:
+                NSWorkspace.shared.activateFileViewerSelecting(completed)
+            case .quickLook:
+                quickLookItems = completed
+                quickLookItem = completed.first
+            case .none:
+                break
+            }
+
+        case .push(let items, let destDir):
+            for (i, item) in items.enumerated() {
+                let remote = join(destDir, item.destName)
+                let monitor = startPushMonitor(localURL: item.url, remotePath: remote,
+                                               index: i + 1, total: items.count)
+                do {
+                    if item.deleteFirst {
+                        try await client.delete(path: remote, serial: serial, su: useSu)
+                    }
+                    try await client.push(localURL: item.url, toRemoteDir: destDir,
+                                          destName: item.destName, serial: serial, suAvailable: suAvailable)
+                    monitor.cancel()
+                } catch is CancellationError {
+                    monitor.cancel()
+                    statusMessage = "Transfer cancelled"
+                    break
+                } catch {
+                    monitor.cancel()
+                    self.error = AdbError(message: "Pushing \(item.destName) failed: \((error as? AdbError)?.message ?? error.localizedDescription)")
+                    break
+                }
+            }
+            invalidateListing(destDir)
+            if currentPath == destDir {
+                await loadCurrentPath()
+            }
         }
     }
 
@@ -615,10 +879,90 @@ final class BrowserViewModel: ObservableObject {
         return (attrs?[.size] as? NSNumber)?.int64Value ?? 0
     }
 
+    // MARK: - Get Info
+
+    func applyFileInfo(_ file: RemoteFile, octal: String?, ownerGroup: String?) {
+        guard let client, let serial = selectedSerial else { return }
+        Task {
+            await withStatus("Applying changes…") {
+                if let octal {
+                    try await client.chmod(octal, path: file.path, serial: serial, su: self.useSu)
+                }
+                if let ownerGroup {
+                    try await client.chown(ownerGroup, path: file.path, serial: serial, su: self.useSu)
+                }
+            }
+            invalidateListing()
+            await loadCurrentPath()
+        }
+    }
+
+    func measureSize(of file: RemoteFile) async -> Int64? {
+        guard let client, let serial = selectedSerial else { return nil }
+        return await client.sizeOf(path: file.path, serial: serial, su: useSu)
+    }
+
+    // MARK: - Storage sunburst
+
+    func loadUsage(force: Bool = false) {
+        guard let client, let serial = selectedSerial else { return }
+        let path = currentPath
+        let key = serial + ":" + path
+        if !force, let cached = usageCache[key] {
+            usageTree = cached
+            return
+        }
+        usageTree = nil
+        isMeasuring = true
+        Task {
+            do {
+                let entries = try await client.diskUsage(path: path, serial: serial, su: useSu)
+                if self.currentPath == path, let tree = UsageNode.build(root: path, entries: entries) {
+                    self.usageCache[key] = tree
+                    self.usageTree = tree
+                }
+            } catch let e as AdbError {
+                self.error = e
+            } catch {}
+            self.isMeasuring = false
+        }
+    }
+
+    func openFromSunburst(_ path: String) {
+        guard let client, let serial = selectedSerial else { return }
+        Task {
+            if await client.isDirectory(path: path, serial: serial, su: self.useSu) {
+                self.navigate(to: path)
+            } else {
+                self.revealSearchResult(path)
+            }
+        }
+    }
+
+    // MARK: - Search & thumbnails
+
+    private let thumbnails = ThumbnailStore()
+
+    func thumbnail(for file: RemoteFile) async -> NSImage? {
+        guard let client, let serial = selectedSerial else { return nil }
+        return await thumbnails.thumbnail(for: file, client: client, serial: serial, suAvailable: suAvailable)
+    }
+
+    func searchDevice(_ query: String) async -> [String] {
+        guard let client, let serial = selectedSerial else { return [] }
+        return await client.find(query: query, under: currentPath, serial: serial, su: useSu)
+    }
+
+    func revealSearchResult(_ path: String) {
+        let parent = (path as NSString).deletingLastPathComponent
+        pendingSelection = path
+        navigate(to: parent.isEmpty ? "/" : parent)
+    }
+
     // MARK: - Helpers
 
     private func childPath(_ name: String) -> String {
-        currentPath == "/" ? "/" + name : currentPath + "/" + name
+        join(currentPath, name)
     }
 
     private func withStatus(_ message: String, _ body: () async throws -> Void) async {
@@ -627,12 +971,13 @@ final class BrowserViewModel: ObservableObject {
         defer {
             isBusy = false
             statusMessage = ""
-            activeTransfer = nil
         }
         do {
             try await body()
         } catch let e as AdbError {
             error = e
+        } catch is CancellationError {
+            statusMessage = "Cancelled"
         } catch {
             self.error = AdbError(message: error.localizedDescription)
         }
