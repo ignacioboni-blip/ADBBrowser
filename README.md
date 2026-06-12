@@ -60,6 +60,9 @@ as the fallback path and for root probes.
   cached list immediately while a silent refresh runs behind it.
 - **Folders-first + natural sort**: directories group on top (toggleable in
   the ⋯ menu) and names sort Finder-style ("IMG_2" before "IMG_10").
+- **Drop an APK to install**: dropping .apk files from Finder asks whether to
+  install them (`adb install -r`, so updates work too) or just copy them like
+  regular files. Mixed drops upload the non-APK files as usual.
 - **Root auto-detection** per device, shown in the status bar:
   1. adbd already running as root → plain commands
   2. `su -c` available (Magisk/KernelSU) → every command wrapped in su
