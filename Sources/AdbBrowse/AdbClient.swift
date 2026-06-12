@@ -319,6 +319,20 @@ final class AdbClient: Sendable {
         guard r.ok else { throw AdbError(message: r.combinedError.isEmpty ? "Command failed: \(command)" : r.combinedError) }
     }
 
+    // MARK: APK install
+
+    /// `adb install -r` — installs (or updates) an app from a local APK.
+    func installApk(at url: URL, serial: String) async throws {
+        let r = try await run(["-s", serial, "install", "-r", url.path], timeout: 600)
+        let output = (r.stdout + "\n" + r.stderr).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard r.ok, output.contains("Success") else {
+            // adb prints the useful reason on the last non-empty line,
+            // e.g. INSTALL_FAILED_VERSION_DOWNGRADE.
+            let reason = output.split(separator: "\n").last.map(String.init) ?? "install failed"
+            throw AdbError(message: reason)
+        }
+    }
+
     // MARK: file metadata (Get Info)
 
     func chmod(_ octal: String, path: String, serial: String, su: Bool) async throws {

@@ -43,6 +43,26 @@ struct ContentView: View {
                      + ((model.conflictPrompt?.names.count ?? 0) > 6 ? ", …" : ""))
             }
             .confirmationDialog(
+                apkDialogTitle,
+                isPresented: apkPromptShown
+            ) {
+                Button("Install on Phone") {
+                    if let urls = model.apkPrompt {
+                        model.apkPrompt = nil
+                        model.installApks(urls)
+                    }
+                }
+                Button("Copy to Current Folder") {
+                    if let urls = model.apkPrompt {
+                        model.apkPrompt = nil
+                        model.upload(urls: urls)
+                    }
+                }
+                Button("Cancel", role: .cancel) { model.apkPrompt = nil }
+            } message: {
+                Text(model.apkPrompt?.map(\.lastPathComponent).joined(separator: ", ") ?? "")
+            }
+            .confirmationDialog(
                 "Delete \(model.pendingDeletion.count) item(s) from the device?",
                 isPresented: deleteConfirmShown
             ) {
@@ -88,6 +108,20 @@ struct ContentView: View {
             get: { model.conflictPrompt != nil },
             set: { if !$0 { model.conflictPrompt = nil } }
         )
+    }
+
+    private var apkPromptShown: Binding<Bool> {
+        Binding(
+            get: { model.apkPrompt != nil },
+            set: { if !$0 { model.apkPrompt = nil } }
+        )
+    }
+
+    private var apkDialogTitle: String {
+        let count = model.apkPrompt?.count ?? 0
+        let device = model.devices.first(where: { $0.serial == model.selectedSerial })?
+            .model.replacingOccurrences(of: "_", with: " ") ?? "the device"
+        return count == 1 ? "Install this APK on \(device)?" : "Install \(count) APKs on \(device)?"
     }
 
     private func resolveConflict(_ resolution: ConflictResolution) {
@@ -356,7 +390,7 @@ struct ContentView: View {
             }
         }
         group.notify(queue: .main) {
-            if !urls.isEmpty { model.upload(urls: urls) }
+            if !urls.isEmpty { model.handleDroppedFiles(urls) }
         }
         return !providers.isEmpty
     }

@@ -139,6 +139,7 @@ final class BrowserViewModel: ObservableObject {
     @Published var error: AdbError?
     @Published var pendingDeletion: [RemoteFile] = []
     @Published var conflictPrompt: ConflictPrompt?
+    @Published var apkPrompt: [URL]?
 
     // Transfer queue
     @Published var activeTransfer: TransferProgress?
@@ -682,6 +683,38 @@ final class BrowserViewModel: ObservableObject {
                 names: conflicts.sorted(),
                 resolve: proceed
             )
+        }
+    }
+
+    /// Files dropped on the window: APKs get an install-or-copy prompt,
+    /// everything else uploads to the current folder.
+    func handleDroppedFiles(_ urls: [URL]) {
+        let apks = urls.filter { $0.pathExtension.lowercased() == "apk" }
+        let others = urls.filter { $0.pathExtension.lowercased() != "apk" }
+        if !others.isEmpty { upload(urls: others) }
+        if !apks.isEmpty { apkPrompt = apks }
+    }
+
+    func installApks(_ urls: [URL]) {
+        guard let client, let serial = selectedSerial else { return }
+        Task {
+            var failures: [String] = []
+            await withStatus("Installing…") {
+                for url in urls {
+                    self.statusMessage = "Installing \(url.lastPathComponent)…"
+                    do {
+                        try await client.installApk(at: url, serial: serial)
+                    } catch {
+                        failures.append("\(url.lastPathComponent): \((error as? AdbError)?.message ?? error.localizedDescription)")
+                    }
+                }
+                if !failures.isEmpty {
+                    throw AdbError(message: failures.joined(separator: "\n"))
+                }
+            }
+            if failures.isEmpty {
+                statusMessage = "Installed \(urls.count == 1 ? urls[0].lastPathComponent : "\(urls.count) APKs")"
+            }
         }
     }
 
