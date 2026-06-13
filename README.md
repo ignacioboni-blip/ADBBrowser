@@ -64,9 +64,15 @@ as the fallback path and for root probes.
   install them (`adb install -r`, so updates work too) or just copy them like
   regular files. Mixed drops upload the non-APK files as usual.
 - **Connect over Wi-Fi (⇧⌘W)**: a guided wizard for Android 11+ wireless
-  debugging — walks through `adb pair HOST:PORT CODE` then `adb connect`, using
-  `adb mdns services` to auto-discover and pre-fill the connect endpoint.
-  Reachable from the no-device screen and the ⋯ menu.
+  debugging, with two modes — scan an on-screen **QR code** with the phone
+  (auto-discovered and paired via mDNS), or enter a **pairing code** manually.
+  Then `adb connect`, with the endpoint auto-filled from mDNS. Reachable from
+  the no-device screen and the ⋯ menu.
+
+  Note: the app forces adb's Bonjour mDNS backend (`ADB_MDNS_OPENSCREEN=0`) on
+  every adb process — recent platform-tools default to a bundled "openscreen"
+  backend that is broken for `adb pair` on macOS (it fails instantly with
+  "protocol fault (couldn't read status message)" before reaching the phone).
 - **Root auto-detection** per device, shown in the status bar:
   1. adbd already running as root → plain commands
   2. `su -c` available (Magisk/KernelSU) → every command wrapped in su

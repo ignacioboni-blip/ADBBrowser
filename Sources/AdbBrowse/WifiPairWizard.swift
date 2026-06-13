@@ -1,4 +1,19 @@
+import CoreImage
+import CoreImage.CIFilterBuiltins
 import SwiftUI
+
+enum QRGenerator {
+    static func image(from string: String) -> NSImage? {
+        let filter = CIFilter.qrCodeGenerator()
+        filter.message = Data(string.utf8)
+        filter.correctionLevel = "M"
+        guard let ci = filter.outputImage?.transformed(by: CGAffineTransform(scaleX: 10, y: 10)) else { return nil }
+        let rep = NSCIImageRep(ciImage: ci)
+        let image = NSImage(size: rep.size)
+        image.addRepresentation(rep)
+        return image
+    }
+}
 
 struct WifiPairWizard: View {
     @ObservedObject var model: BrowserViewModel
@@ -7,8 +22,10 @@ struct WifiPairWizard: View {
     enum Step: Int, CaseIterable {
         case prepare, pair, connect, done
     }
+    enum PairMode { case code, qr }
 
     @State private var step: Step = .prepare
+    @State private var pairMode: PairMode = .qr
     @State private var pairEndpoint = ""
     @State private var pairCode = ""
     @State private var connectEndpoint = ""
@@ -16,6 +33,9 @@ struct WifiPairWizard: View {
     @State private var busy = false
     @State private var errorText: String?
     @State private var discoveredHost: String?
+    @State private var qr: QrPairing?
+    @State private var qrImage: NSImage?
+    @State private var qrWaiting = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -81,12 +101,31 @@ struct WifiPairWizard: View {
             Text("Make sure your Mac and phone are on the same Wi-Fi network, then on your phone:")
                 .fixedSize(horizontal: false, vertical: true)
             instruction(1, "Open Settings ▸ Developer options ▸ Wireless debugging and turn it on.")
-            instruction(2, "Tap “Pair device with pairing code.”")
-            instruction(3, "Keep that screen open — it shows an IP address, port, and a 6-digit code.")
+            instruction(2, "Tap “Pair device with QR code” (or “…with pairing code”).")
+            instruction(3, "On the next screen you'll either scan a code or read off an address and number.")
         }
     }
 
     private var pairStep: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Picker("", selection: $pairMode) {
+                Text("QR code").tag(PairMode.qr)
+                Text("Pairing code").tag(PairMode.code)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+
+            if pairMode == .qr {
+                qrPairContent
+            } else {
+                codePairContent
+            }
+            errorBanner
+        }
+        .task(id: pairMode) { await runQrFlow() }
+    }
+
+    private var codePairContent: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("Enter the IP address, port, and code shown in the “Pair with code” dialog on your phone.")
                 .fixedSize(horizontal: false, vertical: true)
@@ -97,8 +136,31 @@ struct WifiPairWizard: View {
                     .font(.caption)
                     .foregroundStyle(model.accent)
             }
-            errorBanner
         }
+    }
+
+    private var qrPairContent: some View {
+        VStack(spacing: 10) {
+            Text("On your phone, tap “Pair device with QR code” and point the camera at this code.")
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
+            if let qrImage {
+                Image(nsImage: qrImage)
+                    .interpolation(.none)
+                    .resizable()
+                    .frame(width: 170, height: 170)
+                    .padding(8)
+                    .background(Color.white)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+            } else {
+                ProgressView().frame(height: 186)
+            }
+            Label(qrWaiting ? "Waiting for your phone to scan…" : "Preparing…",
+                  systemImage: "antenna.radiowaves.left.and.right")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity)
     }
 
     private var connectStep: some View {
@@ -152,11 +214,13 @@ struct WifiPairWizard: View {
                 .keyboardShortcut(.defaultAction)
                 .buttonStyle(.borderedProminent)
         case .pair:
-            Button(busy ? "Pairing…" : "Pair") { doPair() }
-                .keyboardShortcut(.defaultAction)
-                .buttonStyle(.borderedProminent)
-                .disabled(busy || !isValid(pairEndpoint) || pairCode.count < 4)
-                .overlay { if busy { ProgressView().controlSize(.small) } }
+            if pairMode == .code {
+                Button(busy ? "Pairing…" : "Pair") { doPair() }
+                    .keyboardShortcut(.defaultAction)
+                    .buttonStyle(.borderedProminent)
+                    .disabled(busy || !isValid(pairEndpoint) || pairCode.count < 4)
+                    .overlay { if busy { ProgressView().controlSize(.small) } }
+            }
         case .connect:
             Button(busy ? "Connecting…" : "Connect") { doConnect() }
                 .keyboardShortcut(.defaultAction)
@@ -182,6 +246,29 @@ struct WifiPairWizard: View {
         errorText = nil
         withAnimation(.easeInOut(duration: 0.2)) {
             step = step == .connect ? .pair : .prepare
+        }
+    }
+
+    /// Generate a QR (once) and watch mDNS until the phone scans it, then pair.
+    private func runQrFlow() async {
+        guard step == .pair, pairMode == .qr else { return }
+        errorText = nil
+        if qr == nil {
+            let newQr = model.makeQrPairing()
+            qr = newQr
+            qrImage = QRGenerator.image(from: newQr.payload)
+        }
+        guard let qr else { return }
+        qrWaiting = true
+        defer { qrWaiting = false }
+        do {
+            try await model.qrPairAndWait(qr)
+            advanceTo(.connect)
+            await prefillConnect()
+        } catch is CancellationError {
+            // mode switched or wizard closed — leave quietly
+        } catch {
+            errorText = (error as? AdbError)?.message ?? error.localizedDescription
         }
     }
 

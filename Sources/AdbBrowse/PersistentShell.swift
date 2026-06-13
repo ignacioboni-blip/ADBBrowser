@@ -96,6 +96,7 @@ actor DeviceShell {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: adbPath)
         p.arguments = ["-s", serial, "shell"]
+        p.environment = AdbClient.serverEnvironment
 
         let inPipe = Pipe()
         let outPipe = Pipe()

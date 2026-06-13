@@ -45,6 +45,23 @@ final class AdbClient: Sendable {
 
     // MARK: low-level process runner
 
+    /// Environment for every adb process we spawn. `ADB_MDNS_OPENSCREEN=0`
+    /// forces adb's server to use Apple's Bonjour mDNS backend; the bundled
+    /// "openscreen" backend is broken for `adb pair` on macOS (it faults with
+    /// "protocol fault (couldn't read status message)" before any network I/O).
+    static let serverEnvironment: [String: String] = {
+        var env = ProcessInfo.processInfo.environment
+        env["ADB_MDNS_OPENSCREEN"] = "0"
+        return env
+    }()
+
+    /// Restart the adb server so it picks up `serverEnvironment` (needed when a
+    /// server started by something else — with the broken backend — is running).
+    func restartServer() async {
+        _ = try? await run(["kill-server"], timeout: 10)
+        _ = try? await run(["start-server"], timeout: 20)
+    }
+
     private struct RawResult {
         let stdout: Data
         let stderr: Data
@@ -72,6 +89,7 @@ final class AdbClient: Sendable {
                 let process = Process()
                 process.executableURL = URL(fileURLWithPath: adbPath)
                 process.arguments = arguments
+                process.environment = AdbClient.serverEnvironment
 
                 let outPipe = Pipe()
                 let errPipe = Pipe()
@@ -403,6 +421,7 @@ final class AdbClient: Sendable {
             let process = Process()
             process.executableURL = URL(fileURLWithPath: adbPath)
             process.arguments = ["track-devices"]
+            process.environment = AdbClient.serverEnvironment
             let pipe = Pipe()
             process.standardOutput = pipe
             process.standardError = Pipe()

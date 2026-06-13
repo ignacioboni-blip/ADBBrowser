@@ -292,7 +292,15 @@ final class BrowserViewModel: ObservableObject {
 
     func wifiPair(endpoint: String, code: String) async throws {
         guard let client else { throw AdbError(message: "adb is not available") }
-        try await client.pair(endpoint: endpoint, code: code)
+        do {
+            try await client.pair(endpoint: endpoint, code: code)
+        } catch let e as AdbError where e.message.contains("protocol fault") {
+            // A pre-existing adb server may be using the broken openscreen mDNS
+            // backend. Restart it with Bonjour and retry — the fault happens
+            // before the phone is reached, so the pairing code is still valid.
+            await client.restartServer()
+            try await client.pair(endpoint: endpoint, code: code)
+        }
     }
 
     /// Connect to a paired device and select it. Returns its serial (host:port).
@@ -313,6 +321,39 @@ final class BrowserViewModel: ObservableObject {
     func mdnsScan() async -> [MdnsService] {
         guard let client else { return [] }
         return await client.mdnsServices()
+    }
+
+    /// One-time clean server restart so wireless discovery uses the Bonjour
+    /// mDNS backend (the openscreen default is broken for pairing on macOS).
+    private var wirelessServerReady = false
+    func ensureWirelessReady() async {
+        guard !wirelessServerReady, let client else { return }
+        wirelessServerReady = true
+        await client.restartServer()
+    }
+
+    func makeQrPairing() -> QrPairing {
+        let alphabet = Array("ABCDEFGHJKLMNPQRSTUVWXYZ23456789")
+        func token(_ n: Int) -> String { String((0..<n).map { _ in alphabet.randomElement()! }) }
+        return QrPairing(serviceName: "ADBBrowser-" + token(6), password: token(8))
+    }
+
+    /// After the phone scans the QR it advertises a pairing service named after
+    /// our QR. Watch mDNS for it, then pair with the embedded password.
+    func qrPairAndWait(_ qr: QrPairing) async throws {
+        guard let client else { throw AdbError(message: "adb is not available") }
+        await ensureWirelessReady()
+        let deadline = Date().addingTimeInterval(120)
+        while Date() < deadline {
+            try Task.checkCancellation()
+            let services = await client.mdnsServices()
+            if let pairing = services.first(where: { $0.isPairing && $0.name.contains(qr.serviceName) }) {
+                try await client.pair(endpoint: pairing.endpoint, code: qr.password)
+                return
+            }
+            try? await Task.sleep(for: .seconds(1))
+        }
+        throw AdbError(message: "Timed out waiting for your phone to scan the code.")
     }
 
     private func onDeviceSelected() {

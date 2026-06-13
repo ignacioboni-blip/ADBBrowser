@@ -192,6 +192,13 @@ struct MdnsService: Identifiable, Hashable {
     var host: String { endpoint.split(separator: ":").first.map(String.init) ?? endpoint }
 }
 
+struct QrPairing {
+    let serviceName: String
+    let password: String
+    /// Android's "Pair with QR code" payload format.
+    var payload: String { "WIFI:T:ADB;S:\(serviceName);P:\(password);;" }
+}
+
 // MARK: - Errors
 
 struct AdbError: LocalizedError, Identifiable {
