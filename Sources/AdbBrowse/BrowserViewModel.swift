@@ -220,6 +220,7 @@ final class BrowserViewModel: ObservableObject {
     deinit {
         pollTask?.cancel()
         trackTask?.cancel()
+        reconnectTask?.cancel()
     }
 
     // MARK: - Setup
@@ -247,6 +248,7 @@ final class BrowserViewModel: ObservableObject {
         Task {
             await client.startServer()
             startDeviceTracking(client: client)
+            startReconnectLoop(client: client)
             refreshDevices()
         }
     }
@@ -256,6 +258,11 @@ final class BrowserViewModel: ObservableObject {
         Task {
             let apply = { (found: [DeviceInfo]) in
                 self.devices = found
+                // Remember any ip:port endpoint (even offline) so the
+                // reconnect loop can revive it after a drop.
+                for d in found where d.serial.contains(":") {
+                    self.rememberWireless(d.serial)
+                }
                 if let current = self.selectedSerial, !found.contains(where: { $0.serial == current && $0.isUsable }) {
                     self.selectedSerial = nil
                 }
@@ -269,6 +276,60 @@ final class BrowserViewModel: ObservableObject {
                 await withStatus("Looking for devices…") {
                     apply(try await client.listDevices())
                 }
+            }
+        }
+    }
+
+    // MARK: - Wireless auto-reconnect
+
+    @Published private(set) var knownWirelessEndpoints: [String] =
+        UserDefaults.standard.stringArray(forKey: "wirelessEndpoints") ?? []
+    private var reconnectTask: Task<Void, Never>?
+
+    private func rememberWireless(_ endpoint: String) {
+        guard endpoint.contains(":"), !knownWirelessEndpoints.contains(endpoint) else { return }
+        knownWirelessEndpoints.append(endpoint)
+        if knownWirelessEndpoints.count > 8 { knownWirelessEndpoints.removeFirst() }
+        UserDefaults.standard.set(knownWirelessEndpoints, forKey: "wirelessEndpoints")
+    }
+
+    func forgetWireless(_ endpoint: String) {
+        knownWirelessEndpoints.removeAll { $0 == endpoint }
+        UserDefaults.standard.set(knownWirelessEndpoints, forKey: "wirelessEndpoints")
+        Task { await client?.disconnect(endpoint: endpoint) }
+    }
+
+    /// Quietly revive dropped wireless connections: every few seconds, try to
+    /// reconnect any remembered endpoint that isn't currently online.
+    private func startReconnectLoop(client: AdbClient) {
+        reconnectTask?.cancel()
+        reconnectTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(6))
+                guard let self, !self.knownWirelessEndpoints.isEmpty else { continue }
+                // Work off fresh data so we never disturb a healthy connection.
+                let current = (try? await client.listDevices()) ?? []
+                let online = Set(current.filter { $0.isUsable }.map(\.serial))
+
+                // Targets = remembered fixed endpoints PLUS whatever the phone
+                // is advertising right now via mDNS (its port/IP may have
+                // changed since we last saw it, so the live endpoint wins).
+                var targets = Set(self.knownWirelessEndpoints)
+                for svc in await client.mdnsServices() where svc.isConnect {
+                    targets.insert(svc.endpoint)
+                }
+                let missing = targets.subtracting(online)
+                guard !missing.isEmpty else { continue }
+
+                var revived = false
+                for ep in missing {
+                    await client.disconnect(endpoint: ep)   // clear stale/offline state
+                    if (try? await client.connect(endpoint: ep, timeout: 6)) != nil {
+                        revived = true
+                        self.rememberWireless(ep)
+                    }
+                }
+                if revived { self.refreshDevices(quiet: true) }
             }
         }
     }
@@ -321,6 +382,7 @@ final class BrowserViewModel: ObservableObject {
     func wifiConnect(endpoint: String) async throws -> String {
         guard let client else { throw AdbError(message: "adb is not available") }
         try await client.connect(endpoint: endpoint)
+        rememberWireless(endpoint)
         let found = (try? await client.listDevices()) ?? []
         devices = found
         if found.contains(where: { $0.serial == endpoint && $0.isUsable }) {

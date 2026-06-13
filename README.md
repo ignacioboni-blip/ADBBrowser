@@ -83,6 +83,14 @@ as the fallback path and for root probes.
   `adb devices` two or three times (mDNS auto-connect name + ip:port, plus USB
   if plugged in). The picker collapses these to one entry per physical phone,
   preferring USB, then ip:port, then the mDNS name.
+- **Wireless auto-reconnect**: wireless adb connections drop when the phone
+  sleeps. The app remembers wireless endpoints and, every few seconds, revives
+  any that are missing or offline (disconnect + reconnect). It also watches
+  mDNS for the phone's *current* advertised endpoint, so it reconnects even
+  when Android assigns a new wireless-debugging port on wake. Forget a remembered
+  device from the ⋯ menu. Note: if the phone turns wireless debugging off
+  entirely (Android does this on sleep/idle), nothing can reconnect until it's
+  re-enabled — keeping the phone awake (Developer options → "Stay awake") helps.
 - **Root auto-detection** per device, shown in the status bar:
   1. adbd already running as root → plain commands
   2. `su -c` available (Magisk/KernelSU) → every command wrapped in su

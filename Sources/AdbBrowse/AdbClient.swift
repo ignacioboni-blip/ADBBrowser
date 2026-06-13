@@ -361,8 +361,8 @@ final class AdbClient: Sendable {
     }
 
     /// `adb connect HOST:PORT` — connects to an already-paired device.
-    func connect(endpoint: String) async throws {
-        let r = try await run(["connect", endpoint], timeout: 30)
+    func connect(endpoint: String, timeout: TimeInterval = 30) async throws {
+        let r = try await run(["connect", endpoint], timeout: timeout)
         let out = (r.stdout + "\n" + r.stderr).lowercased()
         guard out.contains("connected to") || out.contains("already connected") else {
             let reason = (r.stdout + "\n" + r.stderr).split(separator: "\n").last.map(String.init)?

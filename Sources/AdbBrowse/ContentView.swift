@@ -448,6 +448,13 @@ struct ContentView: View {
                 Divider()
                 Toggle("Show Hidden Files", isOn: $model.showHidden)
                 Toggle("Folders First", isOn: $model.foldersFirst)
+                if !model.knownWirelessEndpoints.isEmpty {
+                    Menu("Forget Wi-Fi Device") {
+                        ForEach(model.knownWirelessEndpoints, id: \.self) { ep in
+                            Button(ep) { model.forgetWireless(ep) }
+                        }
+                    }
+                }
                 Picker("Density", selection: $model.density) {
                     ForEach(Density.allCases, id: \.self) { d in
                         Text(d.label).tag(d)
