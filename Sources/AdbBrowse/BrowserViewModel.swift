@@ -299,12 +299,20 @@ final class BrowserViewModel: ObservableObject {
         guard let client else { throw AdbError(message: "adb is not available") }
         do {
             try await client.pair(endpoint: endpoint, code: code)
-        } catch let e as AdbError where e.message.contains("protocol fault") {
+        } catch let e as AdbError {
             // A pre-existing adb server may be using the broken openscreen mDNS
             // backend. Restart it with Bonjour and retry — the fault happens
             // before the phone is reached, so the pairing code is still valid.
-            await client.restartServer()
-            try await client.pair(endpoint: endpoint, code: code)
+            if e.message.contains("protocol fault") {
+                await client.restartServer()
+                do {
+                    try await client.pair(endpoint: endpoint, code: code)
+                    return
+                } catch let retry as AdbError {
+                    throw AdbError(message: NetworkInfo.pairingErrorMessage(endpoint: endpoint, underlying: retry.message))
+                }
+            }
+            throw AdbError(message: NetworkInfo.pairingErrorMessage(endpoint: endpoint, underlying: e.message))
         }
     }
 
@@ -353,7 +361,11 @@ final class BrowserViewModel: ObservableObject {
             try Task.checkCancellation()
             let services = await client.mdnsServices()
             if let pairing = services.first(where: { $0.isPairing && $0.name.contains(qr.serviceName) }) {
-                try await client.pair(endpoint: pairing.endpoint, code: qr.password)
+                do {
+                    try await client.pair(endpoint: pairing.endpoint, code: qr.password)
+                } catch let e as AdbError {
+                    throw AdbError(message: NetworkInfo.pairingErrorMessage(endpoint: pairing.endpoint, underlying: e.message))
+                }
                 return
             }
             try? await Task.sleep(for: .seconds(1))

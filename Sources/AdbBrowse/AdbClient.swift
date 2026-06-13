@@ -195,13 +195,16 @@ final class AdbClient: Sendable {
             guard tokens.count >= 2 else { continue }
             let serial = tokens[0]
             let state = tokens[1]
-            var model = ""
-            for t in tokens.dropFirst(2) where t.hasPrefix("model:") {
-                model = String(t.dropFirst("model:".count))
+            var model = "", codename = "", product = ""
+            for t in tokens.dropFirst(2) {
+                if t.hasPrefix("model:") { model = String(t.dropFirst(6)) }
+                else if t.hasPrefix("device:") { codename = String(t.dropFirst(7)) }
+                else if t.hasPrefix("product:") { product = String(t.dropFirst(8)) }
             }
-            devices.append(DeviceInfo(serial: serial, state: state, model: model))
+            devices.append(DeviceInfo(serial: serial, state: state, model: model,
+                                      deviceCodename: codename, product: product))
         }
-        return devices
+        return DeviceInfo.deduplicated(devices)
     }
 
     /// Detect how we can get root without restarting adbd. Uses one-shot

@@ -8,18 +8,63 @@ struct DeviceInfo: Identifiable, Hashable {
     let serial: String
     let state: String      // "device", "unauthorized", "offline", ...
     let model: String      // e.g. "Pixel_10"
+    var deviceCodename: String = ""   // e.g. "frankel"
+    var product: String = ""
 
     var id: String { serial }
 
+    /// True for an `ip:port` or mDNS (`._adb-tls-…`) serial — i.e. not USB.
+    var isWireless: Bool { serial.contains(":") || serial.contains("._") }
+
+    var prettyModel: String { model.replacingOccurrences(of: "_", with: " ") }
+
     var displayName: String {
-        let m = model.replacingOccurrences(of: "_", with: " ")
+        let m = prettyModel
+        let suffix = isWireless ? "Wi-Fi" : (serial.count > 16 ? String(serial.prefix(12)) + "…" : serial)
         if state == "device" {
-            return m.isEmpty ? serial : "\(m) (\(serial))"
+            return m.isEmpty ? serial : "\(m) (\(suffix))"
         }
         return "\(m.isEmpty ? serial : m) — \(state)"
     }
 
     var isUsable: Bool { state == "device" }
+
+    /// Identity shared by all transports of one physical phone. Empty when we
+    /// have no model info (e.g. unauthorized) so those are never merged.
+    var signature: String {
+        model.isEmpty && deviceCodename.isEmpty ? "" : "\(model)|\(deviceCodename)|\(product)"
+    }
+
+    /// Prefer a usable device, then USB > ip:port > mDNS name, when
+    /// collapsing duplicates into one chosen transport.
+    var transportRank: Int {
+        let serialRank: Int
+        if serial.contains("._") { serialRank = 1 }       // adb-…._adb-tls-connect._tcp
+        else if serial.contains(":") { serialRank = 2 }   // 192.168.1.180:41571
+        else { serialRank = 3 }                            // USB serial
+        return (isUsable ? 10 : 0) + serialRank
+    }
+
+    /// Collapse the multiple `adb devices` entries that refer to one phone
+    /// (USB + Wi-Fi + mDNS auto-connect) into a single chosen transport.
+    static func deduplicated(_ devices: [DeviceInfo]) -> [DeviceInfo] {
+        var bySignature: [String: DeviceInfo] = [:]
+        var result: [DeviceInfo] = []
+        for device in devices {
+            guard !device.signature.isEmpty else { result.append(device); continue }
+            if let existing = bySignature[device.signature] {
+                // Keep a usable transport, then the higher-priority serial.
+                if device.transportRank > existing.transportRank {
+                    if let idx = result.firstIndex(of: existing) { result[idx] = device }
+                    bySignature[device.signature] = device
+                }
+            } else {
+                bySignature[device.signature] = device
+                result.append(device)
+            }
+        }
+        return result
+    }
 }
 
 // MARK: - Root mode

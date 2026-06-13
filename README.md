@@ -73,6 +73,16 @@ as the fallback path and for root probes.
   every adb process — recent platform-tools default to a bundled "openscreen"
   backend that is broken for `adb pair` on macOS (it fails instantly with
   "protocol fault (couldn't read status message)" before reaching the phone).
+
+  If pairing fails because the Mac and phone are on **different Wi-Fi subnets**
+  (common with a mesh router like Deco running its own network behind another
+  router), the app detects the subnet mismatch and says so plainly — "Your Mac
+  (192.168.1.x) and phone (192.168.68.x) are on different Wi-Fi networks…" —
+  instead of surfacing adb's cryptic timeout error.
+- **De-duplicated device list**: a wirelessly-connected phone appears in
+  `adb devices` two or three times (mDNS auto-connect name + ip:port, plus USB
+  if plugged in). The picker collapses these to one entry per physical phone,
+  preferring USB, then ip:port, then the mDNS name.
 - **Root auto-detection** per device, shown in the status bar:
   1. adbd already running as root → plain commands
   2. `su -c` available (Magisk/KernelSU) → every command wrapped in su
