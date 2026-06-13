@@ -63,6 +63,10 @@ as the fallback path and for root probes.
 - **Drop an APK to install**: dropping .apk files from Finder asks whether to
   install them (`adb install -r`, so updates work too) or just copy them like
   regular files. Mixed drops upload the non-APK files as usual.
+- **Connect over Wi-Fi (⇧⌘W)**: a guided wizard for Android 11+ wireless
+  debugging — walks through `adb pair HOST:PORT CODE` then `adb connect`, using
+  `adb mdns services` to auto-discover and pre-fill the connect endpoint.
+  Reachable from the no-device screen and the ⋯ menu.
 - **Root auto-detection** per device, shown in the status bar:
   1. adbd already running as root → plain commands
   2. `su -c` available (Magisk/KernelSU) → every command wrapped in su

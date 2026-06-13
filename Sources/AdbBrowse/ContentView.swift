@@ -27,6 +27,9 @@ struct ContentView: View {
             .sheet(item: $model.infoFile) { file in
                 GetInfoSheet(file: file, model: model)
             }
+            .sheet(isPresented: $model.isWifiWizardVisible) {
+                WifiPairWizard(model: model)
+            }
             .alert(item: $model.error) { err in
                 Alert(title: Text("adb Error"), message: Text(err.message), dismissButton: .default(Text("OK")))
             }
@@ -438,6 +441,8 @@ struct ContentView: View {
             .help("Refresh devices and folder")
 
             Menu {
+                Button("Connect over Wi-Fi…") { model.isWifiWizardVisible = true }
+                Divider()
                 Button("New Folder…") { sheet = .newFolder }
                 Button("Upload Files Here…") { model.uploadViaPanel() }
                 Divider()
@@ -546,8 +551,10 @@ struct ContentView: View {
         ContentUnavailableView {
             Label("No Device Connected", systemImage: "iphone.slash")
         } description: {
-            Text("Plug in your phone (or connect over Wi-Fi adb) and make sure USB debugging is authorized.")
+            Text("Plug in your phone and make sure USB debugging is authorized — or connect wirelessly.")
         } actions: {
+            Button("Connect over Wi-Fi…") { model.isWifiWizardVisible = true }
+                .buttonStyle(.borderedProminent)
             Button("Refresh") { model.refreshDevices() }
         }
         .frame(maxHeight: .infinity)

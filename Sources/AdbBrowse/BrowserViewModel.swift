@@ -141,6 +141,7 @@ final class BrowserViewModel: ObservableObject {
     @Published var pendingDeletion: [RemoteFile] = []
     @Published var conflictPrompt: ConflictPrompt?
     @Published var apkPrompt: [URL]?
+    @Published var isWifiWizardVisible = false
 
     // Transfer queue
     @Published var activeTransfer: TransferProgress?
@@ -285,6 +286,33 @@ final class BrowserViewModel: ObservableObject {
                 try? await Task.sleep(for: .seconds(3))
             }
         }
+    }
+
+    // MARK: - Wireless pairing
+
+    func wifiPair(endpoint: String, code: String) async throws {
+        guard let client else { throw AdbError(message: "adb is not available") }
+        try await client.pair(endpoint: endpoint, code: code)
+    }
+
+    /// Connect to a paired device and select it. Returns its serial (host:port).
+    @discardableResult
+    func wifiConnect(endpoint: String) async throws -> String {
+        guard let client else { throw AdbError(message: "adb is not available") }
+        try await client.connect(endpoint: endpoint)
+        let found = (try? await client.listDevices()) ?? []
+        devices = found
+        if found.contains(where: { $0.serial == endpoint && $0.isUsable }) {
+            selectedSerial = endpoint
+        } else if let match = found.first(where: { $0.serial.hasPrefix(endpoint.split(separator: ":").first.map(String.init) ?? endpoint) && $0.isUsable }) {
+            selectedSerial = match.serial
+        }
+        return endpoint
+    }
+
+    func mdnsScan() async -> [MdnsService] {
+        guard let client else { return [] }
+        return await client.mdnsServices()
     }
 
     private func onDeviceSelected() {

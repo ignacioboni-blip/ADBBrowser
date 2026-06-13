@@ -319,6 +319,47 @@ final class AdbClient: Sendable {
         guard r.ok else { throw AdbError(message: r.combinedError.isEmpty ? "Command failed: \(command)" : r.combinedError) }
     }
 
+    // MARK: wireless pairing / connection
+
+    /// `adb pair HOST:PORT CODE` — pairs with the phone's "Pair with code" dialog.
+    func pair(endpoint: String, code: String) async throws {
+        let r = try await run(["pair", endpoint, code], timeout: 30)
+        let out = (r.stdout + "\n" + r.stderr).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard out.localizedCaseInsensitiveContains("success") else {
+            let reason = out.split(separator: "\n").last.map(String.init)?
+                .trimmingCharacters(in: .whitespaces) ?? ""
+            throw AdbError(message: reason.isEmpty ? "Pairing failed — check the code and address." : reason)
+        }
+    }
+
+    /// `adb connect HOST:PORT` — connects to an already-paired device.
+    func connect(endpoint: String) async throws {
+        let r = try await run(["connect", endpoint], timeout: 30)
+        let out = (r.stdout + "\n" + r.stderr).lowercased()
+        guard out.contains("connected to") || out.contains("already connected") else {
+            let reason = (r.stdout + "\n" + r.stderr).split(separator: "\n").last.map(String.init)?
+                .trimmingCharacters(in: .whitespaces) ?? ""
+            throw AdbError(message: reason.isEmpty ? "Could not connect to \(endpoint)." : reason)
+        }
+    }
+
+    func disconnect(endpoint: String) async {
+        _ = try? await run(["disconnect", endpoint], timeout: 10)
+    }
+
+    /// `adb mdns services` — devices advertising wireless debugging on the LAN.
+    func mdnsServices() async -> [MdnsService] {
+        guard let r = try? await run(["mdns", "services"], timeout: 12), r.ok else { return [] }
+        var services: [MdnsService] = []
+        for line in r.stdout.split(separator: "\n").dropFirst() {
+            let cols = line.split(whereSeparator: { $0 == "\t" || $0 == " " })
+                .map(String.init).filter { !$0.isEmpty }
+            guard cols.count >= 3, cols[2].contains(":") else { continue }
+            services.append(MdnsService(name: cols[0], type: cols[1], endpoint: cols[2]))
+        }
+        return services
+    }
+
     // MARK: APK install
 
     /// `adb install -r` — installs (or updates) an app from a local APK.

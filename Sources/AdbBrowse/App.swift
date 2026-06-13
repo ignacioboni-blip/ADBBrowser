@@ -45,6 +45,10 @@ struct AdbBrowseApp: App {
                 Button("View as Storage Map") { model.viewMode = .sunburst }
                     .keyboardShortcut("3")
                 Divider()
+                Button("Connect over Wi-Fi…") {
+                    model.isWifiWizardVisible = true
+                }
+                .keyboardShortcut("w", modifiers: [.command, .shift])
                 Button("Go to Folder…") {
                     model.pathFieldText = model.currentPath
                     model.isEditingPath = true

@@ -179,6 +179,19 @@ enum LsParser {
     }
 }
 
+// MARK: - Wireless (mDNS) discovery
+
+struct MdnsService: Identifiable, Hashable {
+    let name: String
+    let type: String        // _adb-tls-connect._tcp / _adb-tls-pairing._tcp
+    let endpoint: String     // host:port
+
+    var id: String { name + type + endpoint }
+    var isConnect: Bool { type.contains("connect") }
+    var isPairing: Bool { type.contains("pairing") }
+    var host: String { endpoint.split(separator: ":").first.map(String.init) ?? endpoint }
+}
+
 // MARK: - Errors
 
 struct AdbError: LocalizedError, Identifiable {
