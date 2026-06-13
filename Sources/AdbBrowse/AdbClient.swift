@@ -55,6 +55,13 @@ final class AdbClient: Sendable {
         return env
     }()
 
+    /// Start the adb server once, up front. Without this, the app's concurrent
+    /// startup calls each try to fork-start a server and collide on port 5037
+    /// ("Address already in use" / "server didn't ACK").
+    func startServer() async {
+        _ = try? await run(["start-server"], timeout: 30)
+    }
+
     /// Restart the adb server so it picks up `serverEnvironment` (needed when a
     /// server started by something else — with the broken backend — is running).
     func restartServer() async {

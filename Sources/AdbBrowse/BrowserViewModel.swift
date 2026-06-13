@@ -242,8 +242,13 @@ final class BrowserViewModel: ObservableObject {
             currentPath = normalize(start)
             pathFieldText = currentPath
         }
-        startDeviceTracking(client: client)
-        refreshDevices()
+        // Start the server first, then fire concurrent calls — otherwise they
+        // race to bind port 5037 on a cold start and all fail.
+        Task {
+            await client.startServer()
+            startDeviceTracking(client: client)
+            refreshDevices()
+        }
     }
 
     func refreshDevices(quiet: Bool = false) {
