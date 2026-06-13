@@ -122,6 +122,7 @@ final class BrowserViewModel: ObservableObject {
         didSet { UserDefaults.standard.set(density.rawValue, forKey: "density") }
     }
     @Published private(set) var navDirection: NavDirection = .forward
+    @Published private(set) var navTick = 0
     @Published var isPaletteVisible = false
     @Published var recentPaths: [String] = UserDefaults.standard.stringArray(forKey: "recentPaths") ?? []
     @Published var quickLookItem: URL?
@@ -360,9 +361,11 @@ final class BrowserViewModel: ObservableObject {
 
     private func setPath(_ path: String, direction: NavDirection) {
         navDirection = direction
-        withAnimation(.spring(response: 0.32, dampingFraction: 0.85)) {
-            currentPath = path
-        }
+        navTick &+= 1
+        // No withAnimation here: identity-swap transitions on the
+        // NSTableView-backed Table left ghost views that swallowed clicks.
+        // The zoom effect is a transform pulse in ContentView instead.
+        currentPath = path
         Task { await loadCurrentPath() }
     }
 

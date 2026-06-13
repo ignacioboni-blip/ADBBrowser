@@ -228,22 +228,32 @@ struct ContentView: View {
 
     // MARK: - Browser (list/grid with zoom transitions)
 
+    @State private var zoomScale: CGFloat = 1
+    @State private var zoomOpacity: Double = 1
+
     private var browser: some View {
-        ZStack {
-            Group {
-                switch model.viewMode {
-                case .list:
-                    fileTable
-                case .grid:
-                    FileGridView(model: model) { files in
-                        AnyView(contextMenu(files: files))
-                    }
-                case .sunburst:
-                    SunburstView(model: model)
+        Group {
+            switch model.viewMode {
+            case .list:
+                fileTable
+            case .grid:
+                FileGridView(model: model) { files in
+                    AnyView(contextMenu(files: files))
                 }
+            case .sunburst:
+                SunburstView(model: model)
             }
-            .id(model.currentPath)
-            .transition(navTransition)
+        }
+        .scaleEffect(zoomScale)
+        .opacity(zoomOpacity)
+        .onChange(of: model.navTick) { _, _ in
+            // Zoom pulse on the live view — never a second, ghost view.
+            zoomScale = model.navDirection == .forward ? 0.97 : 1.03
+            zoomOpacity = 0.6
+            withAnimation(.easeOut(duration: 0.18)) {
+                zoomScale = 1
+                zoomOpacity = 1
+            }
         }
         .onKeyPress(.space) {
             let files = model.selectedFiles.filter { $0.type == .file }
@@ -262,22 +272,6 @@ struct ContentView: View {
                     .padding(4)
                     .allowsHitTesting(false)
             }
-        }
-    }
-
-    /// Forward feels like zooming into the folder; backward zooms out of it.
-    private var navTransition: AnyTransition {
-        switch model.navDirection {
-        case .forward:
-            return .asymmetric(
-                insertion: .scale(scale: 0.94).combined(with: .opacity),
-                removal: .scale(scale: 1.06).combined(with: .opacity)
-            )
-        case .backward:
-            return .asymmetric(
-                insertion: .scale(scale: 1.06).combined(with: .opacity),
-                removal: .scale(scale: 0.94).combined(with: .opacity)
-            )
         }
     }
 
