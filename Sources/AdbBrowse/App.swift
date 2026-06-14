@@ -49,6 +49,20 @@ struct AdbBrowseApp: App {
                     model.isWifiWizardVisible = true
                 }
                 .keyboardShortcut("w", modifiers: [.command, .shift])
+                Button("Connection Diagnostics…") {
+                    model.showDiagnostics()
+                }
+                .keyboardShortcut("d", modifiers: [.command, .shift])
+                Button("Logcat…") {
+                    model.isLogcatVisible = true
+                    if !model.isLogcatRunning { model.startLogcat() }
+                }
+                .keyboardShortcut("l", modifiers: [.command, .shift])
+                Button("APK Manager…") {
+                    model.isApkManagerVisible = true
+                    if model.packages.isEmpty { model.loadPackages() }
+                }
+                .keyboardShortcut("p", modifiers: [.command, .shift])
                 Button("Go to Folder…") {
                     model.pathFieldText = model.currentPath
                     model.isEditingPath = true
@@ -73,6 +87,12 @@ struct AdbBrowseApp: App {
                 Divider()
                 Button("Show Hidden Files") { model.showHidden.toggle() }
                     .keyboardShortcut(".", modifiers: [.command, .shift])
+            }
+            CommandGroup(replacing: .help) {
+                Button("ADB Browser Help") {
+                    model.isHelpVisible = true
+                }
+                .keyboardShortcut("/", modifiers: [.command, .shift])
             }
         }
 

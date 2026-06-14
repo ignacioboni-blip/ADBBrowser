@@ -11,6 +11,12 @@ struct ShellResult {
         if !e.isEmpty { return e }
         return stdout.trimmingCharacters(in: .whitespacesAndNewlines)
     }
+    var combinedOutput: String {
+        [stdout, stderr]
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n")
+    }
 }
 
 /// Thin async wrapper around the adb binary. All methods are safe to call
@@ -39,6 +45,25 @@ final class AdbClient: Sendable {
         }
         for path in candidates where FileManager.default.isExecutableFile(atPath: path) {
             return path
+        }
+        return nil
+    }
+
+    static func resolveAapt2Path() -> String? {
+        var roots: [String] = []
+        if let home = ProcessInfo.processInfo.environment["ANDROID_HOME"] {
+            roots.append(home + "/build-tools")
+        }
+        roots.append(NSHomeDirectory() + "/Library/Android/sdk/build-tools")
+
+        for root in roots {
+            guard let versions = try? FileManager.default.contentsOfDirectory(atPath: root) else { continue }
+            for version in versions.sorted(by: { $0.localizedStandardCompare($1) == .orderedDescending }) {
+                let candidate = root + "/" + version + "/aapt2"
+                if FileManager.default.isExecutableFile(atPath: candidate) {
+                    return candidate
+                }
+            }
         }
         return nil
     }
@@ -155,6 +180,80 @@ final class AdbClient: Sendable {
         }
     }
 
+    private static func runLocal(_ executable: String, _ arguments: [String], timeout: TimeInterval) async throws -> ShellResult {
+        let raw = try await runLocalRaw(executable, arguments, timeout: timeout)
+        return ShellResult(
+            stdout: String(data: raw.stdout, encoding: .utf8) ?? "",
+            stderr: String(data: raw.stderr, encoding: .utf8) ?? "",
+            exitCode: raw.exitCode
+        )
+    }
+
+    private static func runLocalRaw(_ executable: String, _ arguments: [String], timeout: TimeInterval) async throws -> RawResult {
+        let box = ProcessBox()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                if box.isCancelled {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: executable)
+                process.arguments = arguments
+
+                let outPipe = Pipe()
+                let errPipe = Pipe()
+                process.standardOutput = outPipe
+                process.standardError = errPipe
+
+                let group = DispatchGroup()
+                var outData = Data()
+                var errData = Data()
+
+                group.enter()
+                DispatchQueue.global().async {
+                    outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+                    group.leave()
+                }
+                group.enter()
+                DispatchQueue.global().async {
+                    errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+                    group.leave()
+                }
+
+                do {
+                    try process.run()
+                } catch {
+                    continuation.resume(throwing: AdbError(message: "Could not launch \(executable): \(error.localizedDescription)"))
+                    return
+                }
+                box.attach(process)
+
+                let timedOut = LockedFlag()
+                DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
+                    if process.isRunning {
+                        timedOut.set()
+                        process.terminate()
+                    }
+                }
+
+                DispatchQueue.global().async {
+                    process.waitUntilExit()
+                    group.wait()
+                    if box.isCancelled {
+                        continuation.resume(throwing: CancellationError())
+                    } else if timedOut.value {
+                        continuation.resume(throwing: AdbError(message: "\(executable) timed out"))
+                    } else {
+                        continuation.resume(returning: RawResult(stdout: outData, stderr: errData, exitCode: process.terminationStatus))
+                    }
+                }
+            }
+        } onCancel: {
+            box.cancel()
+        }
+    }
+
     // MARK: shell helpers
 
     /// Quote a string for the device-side shell.
@@ -256,9 +355,32 @@ final class AdbClient: Sendable {
            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             status.seedHex = (obj["android.theme.customization.system_palette"] as? String)
                 ?? (obj["android.theme.customization.accent_color"] as? String)
+            status.seedSource = obj["android.theme.customization.color_source"] as? String
         }
 
         return status
+    }
+
+    func wallpaperSignature(serial: String, suAvailable: Bool) async -> String? {
+        let command = "stat -c '%Y:%s' /data/system/users/0/wallpaper 2>/dev/null"
+        if suAvailable,
+           let r = try? await oneShotShell(command, serial: serial, su: true, timeout: 10),
+           r.ok {
+            return r.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if let r = try? await oneShotShell(command, serial: serial, su: false, timeout: 10), r.ok {
+            return r.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return nil
+    }
+
+    func pullWallpaper(to dir: URL, serial: String, suAvailable: Bool) async throws -> URL {
+        try await pull(remotePath: "/data/system/users/0/wallpaper",
+                       fileName: "wallpaper",
+                       toLocalDir: dir,
+                       serial: serial,
+                       suAvailable: suAvailable)
+        return dir.appendingPathComponent("wallpaper")
     }
 
     /// Recursive case-insensitive filename search, capped at 80 results.
@@ -375,6 +497,25 @@ final class AdbClient: Sendable {
         _ = try? await run(["disconnect", endpoint], timeout: 10)
     }
 
+    func diagnostics(knownWirelessEndpoints: [String]) async -> ConnectionDiagnostics {
+        async let version = run(["version"], timeout: 8)
+        async let devices = run(["devices", "-l"], timeout: 10)
+        async let mdns = run(["mdns", "services"], timeout: 12)
+
+        let versionResult = try? await version
+        let devicesResult = try? await devices
+        let mdnsResult = try? await mdns
+
+        return ConnectionDiagnostics(
+            adbPath: adbPath,
+            adbVersion: versionResult?.combinedOutput ?? "Could not read adb version",
+            devicesOutput: devicesResult?.combinedOutput ?? "Could not read adb devices",
+            mdnsOutput: mdnsResult?.combinedOutput ?? "Could not read adb mDNS services",
+            knownWirelessEndpoints: knownWirelessEndpoints,
+            generatedAt: Date()
+        )
+    }
+
     /// `adb mdns services` — devices advertising wireless debugging on the LAN.
     func mdnsServices() async -> [MdnsService] {
         guard let r = try? await run(["mdns", "services"], timeout: 12), r.ok else { return [] }
@@ -386,6 +527,190 @@ final class AdbClient: Sendable {
             services.append(MdnsService(name: cols[0], type: cols[1], endpoint: cols[2]))
         }
         return services
+    }
+
+    // MARK: logcat
+
+    func logcat(serial: String) -> AsyncStream<String> {
+        let adbPath = self.adbPath
+        return AsyncStream { continuation in
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: adbPath)
+            process.arguments = ["-s", serial, "logcat", "-v", "threadtime", "-T", "1"]
+            process.environment = AdbClient.serverEnvironment
+            let outPipe = Pipe()
+            process.standardOutput = outPipe
+            process.standardError = Pipe()
+
+            var buffer = Data()
+            outPipe.fileHandleForReading.readabilityHandler = { handle in
+                let data = handle.availableData
+                if data.isEmpty {
+                    handle.readabilityHandler = nil
+                    continuation.finish()
+                    return
+                }
+                buffer.append(data)
+                while let newline = buffer.firstIndex(of: 10) {
+                    let lineData = buffer[..<newline]
+                    buffer.removeSubrange(...newline)
+                    if let line = String(data: lineData, encoding: .utf8), !line.isEmpty {
+                        continuation.yield(line)
+                    }
+                }
+            }
+            process.terminationHandler = { _ in continuation.finish() }
+            continuation.onTermination = { _ in
+                outPipe.fileHandleForReading.readabilityHandler = nil
+                if process.isRunning { process.terminate() }
+            }
+            do {
+                try process.run()
+            } catch {
+                continuation.finish()
+            }
+        }
+    }
+
+    func clearLogcat(serial: String) async {
+        _ = try? await run(["-s", serial, "logcat", "-c"], timeout: 8)
+    }
+
+    // MARK: packages
+
+    func listPackages(serial: String, thirdPartyOnly: Bool) async throws -> [AndroidPackage] {
+        let flag = thirdPartyOnly ? "-3" : ""
+        let command = ["pm", "list", "packages", "-f", flag]
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        let r = try await oneShotShell(command, serial: serial, su: false, timeout: 45)
+        guard r.ok else { throw AdbError(message: r.combinedError.isEmpty ? "Could not list packages" : r.combinedError) }
+        return r.stdout
+            .split(separator: "\n")
+            .compactMap { line -> AndroidPackage? in
+                let text = String(line).trimmingCharacters(in: .whitespacesAndNewlines)
+                guard text.hasPrefix("package:"), let eq = text.lastIndex(of: "=") else { return nil }
+                let pathStart = text.index(text.startIndex, offsetBy: "package:".count)
+                let path = String(text[pathStart..<eq])
+                let name = String(text[text.index(after: eq)...])
+                guard !name.isEmpty, !path.isEmpty else { return nil }
+                return AndroidPackage(name: name, apkPath: path)
+            }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    func enrichPackage(_ package: AndroidPackage, serial: String) async -> AndroidPackage {
+        guard let aapt2 = Self.resolveAapt2Path() else { return package }
+        let workDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AdbBrowsePackageMetadata", isDirectory: true)
+            .appendingPathComponent(package.name, isDirectory: true)
+        try? FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
+
+        let apkURL = workDir.appendingPathComponent("base.apk")
+        if !FileManager.default.fileExists(atPath: apkURL.path) {
+            let pulled = try? await run(["-s", serial, "pull", package.apkPath, apkURL.path], timeout: 45)
+            guard pulled?.ok == true else { return package }
+        }
+
+        guard let badging = try? await Self.runLocal(aapt2, ["dump", "badging", apkURL.path], timeout: 15),
+              badging.ok else { return package }
+
+        var enriched = package
+        enriched.label = Self.bestApplicationLabel(from: badging.stdout)
+
+        if let iconInApk = Self.bestIconPath(from: badging.stdout) {
+            let ext = (iconInApk as NSString).pathExtension
+            let iconURL = workDir.appendingPathComponent("icon.\(ext.isEmpty ? "png" : ext)")
+            if !FileManager.default.fileExists(atPath: iconURL.path),
+               let iconData = try? await Self.runLocalRaw("/usr/bin/unzip", ["-p", apkURL.path, iconInApk], timeout: 10),
+               iconData.exitCode == 0,
+               !iconData.stdout.isEmpty {
+                try? iconData.stdout.write(to: iconURL)
+            }
+            if FileManager.default.fileExists(atPath: iconURL.path) {
+                enriched.iconPath = iconURL.path
+            }
+        }
+
+        return enriched
+    }
+
+    private static func badgingValue(prefix: String, in text: String) -> String? {
+        for line in text.split(separator: "\n").map(String.init) where line.hasPrefix(prefix) {
+            let raw = String(line.dropFirst(prefix.count)).trimmingCharacters(in: .whitespaces)
+            return raw.trimmingCharacters(in: CharacterSet(charactersIn: "'\""))
+        }
+        return nil
+    }
+
+    private static func bestApplicationLabel(from badging: String) -> String? {
+        if let defaultLabel = badgingValue(prefix: "application-label:", in: badging) {
+            return defaultLabel
+        }
+
+        let localized = badging
+            .split(separator: "\n")
+            .map(String.init)
+            .filter { $0.hasPrefix("application-label-") }
+            .compactMap { line -> (locale: String, label: String)? in
+                guard let colon = line.firstIndex(of: ":") else { return nil }
+                let localeStart = line.index(line.startIndex, offsetBy: "application-label-".count)
+                let locale = String(line[localeStart..<colon])
+                let raw = String(line[line.index(after: colon)...])
+                    .trimmingCharacters(in: .whitespaces)
+                    .trimmingCharacters(in: CharacterSet(charactersIn: "'\""))
+                guard !raw.isEmpty else { return nil }
+                return (locale, raw)
+            }
+
+        if let english = localized.first(where: { $0.locale.hasPrefix("en") }) {
+            return english.label
+        }
+        if let first = localized.first {
+            return first.label
+        }
+        return badgingValue(prefix: "application: label=", in: badging)
+    }
+
+    private static func bestIconPath(from badging: String) -> String? {
+        let iconLines = badging
+            .split(separator: "\n")
+            .map(String.init)
+            .filter { $0.hasPrefix("application-icon-") || $0.hasPrefix("application-icon:") }
+
+        let bitmap = iconLines.compactMap { line -> String? in
+            guard let value = line.split(separator: ":", maxSplits: 1).last else { return nil }
+            let path = String(value).trimmingCharacters(in: .whitespaces)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "'\""))
+            let ext = (path as NSString).pathExtension.lowercased()
+            return ["png", "webp", "jpg", "jpeg"].contains(ext) ? path : nil
+        }
+        return bitmap.last
+    }
+
+    func launchPackage(_ package: String, serial: String) async throws {
+        let command = "monkey -p \(Self.quote(package)) -c android.intent.category.LAUNCHER 1"
+        let r = try await oneShotShell(command, serial: serial, su: false, timeout: 15)
+        guard r.ok else { throw AdbError(message: r.combinedError.isEmpty ? "Could not launch \(package)" : r.combinedError) }
+    }
+
+    func forceStopPackage(_ package: String, serial: String) async throws {
+        let r = try await oneShotShell("am force-stop \(Self.quote(package))", serial: serial, su: false, timeout: 10)
+        guard r.ok else { throw AdbError(message: r.combinedError.isEmpty ? "Could not force-stop \(package)" : r.combinedError) }
+    }
+
+    func clearPackageData(_ package: String, serial: String) async throws {
+        let r = try await oneShotShell("pm clear \(Self.quote(package))", serial: serial, su: false, timeout: 25)
+        guard r.ok, r.stdout.localizedCaseInsensitiveContains("success") else {
+            throw AdbError(message: r.combinedError.isEmpty ? "Could not clear \(package)" : r.combinedError)
+        }
+    }
+
+    func uninstallPackage(_ package: String, serial: String) async throws {
+        let r = try await run(["-s", serial, "uninstall", package], timeout: 60)
+        guard r.ok, r.stdout.localizedCaseInsensitiveContains("success") else {
+            throw AdbError(message: r.combinedError.isEmpty ? "Could not uninstall \(package)" : r.combinedError)
+        }
     }
 
     // MARK: APK install

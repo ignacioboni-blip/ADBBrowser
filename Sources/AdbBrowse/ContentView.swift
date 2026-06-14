@@ -30,6 +30,21 @@ struct ContentView: View {
             .sheet(isPresented: $model.isWifiWizardVisible) {
                 WifiPairWizard(model: model)
             }
+            .sheet(isPresented: $model.isDiagnosticsVisible) {
+                ConnectionDiagnosticsView(model: model)
+            }
+            .sheet(isPresented: $model.isLogcatVisible) {
+                LogcatView(model: model)
+            }
+            .sheet(isPresented: $model.isApkManagerVisible) {
+                ApkManagerView(model: model)
+            }
+            .sheet(isPresented: $model.isHelpVisible) {
+                HelpView()
+            }
+            .sheet(isPresented: $model.isTransferDrawerVisible) {
+                TransferDrawerView(model: model)
+            }
             .alert(item: $model.error) { err in
                 Alert(title: Text("adb Error"), message: Text(err.message), dismissButton: .default(Text("OK")))
             }
@@ -294,6 +309,7 @@ struct ContentView: View {
                 }
                 .padding(.vertical, compact ? 0 : 2)
                 .draggable(file)
+                .help("Drag to Finder to download")
             }
             .width(min: 200, ideal: 320)
 
@@ -412,7 +428,7 @@ struct ContentView: View {
             BreadcrumbBar(model: model)
         }
 
-        ToolbarItemGroup {
+        ToolbarItemGroup(placement: .primaryAction) {
             Picker("View", selection: $model.viewMode) {
                 Image(systemName: "list.bullet").tag(ViewMode.list)
                 Image(systemName: "square.grid.2x2").tag(ViewMode.grid)
@@ -434,37 +450,82 @@ struct ContentView: View {
                 .frame(minWidth: 140)
                 .help("Connected devices")
             }
+        }
 
+        ToolbarItemGroup(placement: .primaryAction) {
             Button { model.refreshDevices(); model.reload() } label: {
                 Image(systemName: "arrow.clockwise")
             }
             .help("Refresh devices and folder")
 
-            Menu {
-                Button("Connect over Wi-Fi…") { model.isWifiWizardVisible = true }
-                Divider()
-                Button("New Folder…") { sheet = .newFolder }
-                Button("Upload Files Here…") { model.uploadViaPanel() }
-                Divider()
-                Toggle("Show Hidden Files", isOn: $model.showHidden)
-                Toggle("Folders First", isOn: $model.foldersFirst)
-                if !model.knownWirelessEndpoints.isEmpty {
-                    Menu("Forget Wi-Fi Device") {
-                        ForEach(model.knownWirelessEndpoints, id: \.self) { ep in
-                            Button(ep) { model.forgetWireless(ep) }
-                        }
-                    }
-                }
-                Picker("Density", selection: $model.density) {
-                    ForEach(Density.allCases, id: \.self) { d in
-                        Text(d.label).tag(d)
-                    }
-                }
-                .pickerStyle(.inline)
-            } label: {
-                Image(systemName: "ellipsis.circle")
+            Button { model.isWifiWizardVisible = true } label: {
+                Label("Wi-Fi", systemImage: "wifi")
             }
-            .help("Actions")
+            .labelStyle(.titleAndIcon)
+            .help("Connect over Wi-Fi")
+
+            Button { model.showDiagnostics() } label: {
+                Label("Diagnostics", systemImage: "stethoscope")
+            }
+            .labelStyle(.titleAndIcon)
+            .help("Connection diagnostics")
+
+            Button {
+                model.isLogcatVisible = true
+                if !model.isLogcatRunning { model.startLogcat() }
+            } label: {
+                Label("Logcat", systemImage: "doc.text.magnifyingglass")
+            }
+            .labelStyle(.titleAndIcon)
+            .help("Logcat")
+            .disabled(model.selectedSerial == nil)
+
+            Button {
+                model.isApkManagerVisible = true
+                if model.packages.isEmpty { model.loadPackages() }
+            } label: {
+                Label("APKs", systemImage: "shippingbox")
+            }
+            .labelStyle(.titleAndIcon)
+            .help("APK manager")
+            .disabled(model.selectedSerial == nil)
+        }
+
+        ToolbarItemGroup(placement: .primaryAction) {
+            Button { sheet = .newFolder } label: {
+                Label("Folder", systemImage: "folder.badge.plus")
+            }
+            .labelStyle(.titleAndIcon)
+            .help("New folder")
+            .disabled(model.selectedSerial == nil)
+
+            Button { model.uploadViaPanel() } label: {
+                Label("Upload", systemImage: "square.and.arrow.up")
+            }
+            .labelStyle(.titleAndIcon)
+            .help("Upload files here")
+            .disabled(model.selectedSerial == nil)
+
+            Button { model.addBookmarkForCurrentPath() } label: {
+                Label("Favorite", systemImage: model.canBookmarkCurrentPath ? "star" : "star.fill")
+            }
+            .labelStyle(.titleAndIcon)
+            .help("Bookmark this folder")
+            .disabled(model.selectedSerial == nil || !model.canBookmarkCurrentPath)
+        }
+
+        ToolbarItemGroup(placement: .primaryAction) {
+            Button { model.showHidden.toggle() } label: {
+                Label("Hidden", systemImage: model.showHidden ? "eye.fill" : "eye")
+            }
+            .labelStyle(.titleAndIcon)
+            .help("Show hidden files")
+
+            Button { model.foldersFirst.toggle() } label: {
+                Label("Folders", systemImage: model.foldersFirst ? "folder.fill.badge.gearshape" : "folder")
+            }
+            .labelStyle(.titleAndIcon)
+            .help("Folders first")
         }
     }
 
@@ -503,8 +564,14 @@ struct ContentView: View {
                 .buttonStyle(.plain)
                 .help("Cancel this transfer")
                 if model.queuedTransferCount > 0 {
-                    Text("+\(model.queuedTransferCount) queued")
-                        .foregroundStyle(.tertiary)
+                    Button {
+                        model.isTransferDrawerVisible = true
+                    } label: {
+                        Label("+\(model.queuedTransferCount)", systemImage: "tray.full")
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.tertiary)
+                    .help("Show transfer queue")
                 }
             } else if model.isBusy {
                 ProgressView().controlSize(.small)
@@ -517,6 +584,15 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
+            if model.hasTransfers {
+                Button {
+                    model.isTransferDrawerVisible = true
+                } label: {
+                    Image(systemName: "tray.full")
+                }
+                .buttonStyle(.plain)
+                .help("Show transfers")
+            }
             if model.selectedSerial != nil {
                 Label(model.rootMode.badge, systemImage: model.suAvailable ? "lock.open.fill" : "lock")
                     .font(.caption)

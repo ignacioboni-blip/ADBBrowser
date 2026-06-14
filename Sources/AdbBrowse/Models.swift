@@ -27,6 +27,9 @@ struct DeviceInfo: Identifiable, Hashable {
         return "\(m.isEmpty ? serial : m) — \(state)"
     }
 
+    var transportName: String { isWireless ? "Wi-Fi ADB" : "USB ADB" }
+    var transportIcon: String { isWireless ? "wifi" : "cable.connector" }
+
     var isUsable: Bool { state == "device" }
 
     /// Identity shared by all transports of one physical phone. Empty when we
@@ -242,6 +245,63 @@ struct QrPairing {
     let password: String
     /// Android's "Pair with QR code" payload format.
     var payload: String { "WIFI:T:ADB;S:\(serviceName);P:\(password);;" }
+}
+
+// MARK: - Connection diagnostics
+
+struct ConnectionDiagnostics: Equatable {
+    var adbPath = ""
+    var adbVersion = ""
+    var devicesOutput = ""
+    var mdnsOutput = ""
+    var knownWirelessEndpoints: [String] = []
+    var generatedAt = Date()
+}
+
+// MARK: - Android packages
+
+struct AndroidPackage: Identifiable, Hashable {
+    let name: String
+    let apkPath: String
+    var label: String?
+    var iconPath: String?
+
+    var id: String { name }
+    var displayName: String { label?.isEmpty == false ? label! : name }
+    var shortName: String {
+        name.split(separator: ".").last.map(String.init) ?? name
+    }
+}
+
+// MARK: - Logcat
+
+struct LogcatLine: Identifiable, Hashable {
+    let id = UUID()
+    let text: String
+
+    var level: String {
+        let parts = text.split(separator: " ", omittingEmptySubsequences: true)
+        guard parts.count > 4 else { return "" }
+        return String(parts[4])
+    }
+
+    var tag: String {
+        let pieces = text.split(separator: ":")
+        guard pieces.count > 1 else { return "" }
+        return pieces.dropLast().last?
+            .split(separator: " ", omittingEmptySubsequences: true)
+            .last
+            .map(String.init) ?? ""
+    }
+}
+
+// MARK: - Favorites
+
+struct BookmarkedPath: Identifiable, Hashable, Codable {
+    var name: String
+    let path: String
+
+    var id: String { path }
 }
 
 // MARK: - Errors

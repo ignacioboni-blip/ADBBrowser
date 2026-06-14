@@ -35,6 +35,43 @@ struct DeviceSidebarView: View {
                     )
                 }
             }
+            if !model.bookmarks.isEmpty {
+                Section("Favorites") {
+                    ForEach(model.bookmarks) { bookmark in
+                        let isCurrent = model.currentPath == bookmark.path
+                        Button {
+                            model.navigate(to: bookmark.path)
+                        } label: {
+                            Label {
+                                Text(bookmark.name)
+                                    .fontWeight(isCurrent ? .semibold : .regular)
+                                    .lineLimit(1)
+                            } icon: {
+                                Image(systemName: "star.fill")
+                                    .foregroundStyle(isCurrent ? model.accent : Color.secondary)
+                            }
+                            .foregroundStyle(isCurrent ? model.accent : Color.primary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .contextMenu {
+                            Button("Rename Favorite…") { model.renameBookmark(bookmark) }
+                            Button("Remove Favorite") { model.removeBookmark(bookmark.path) }
+                            Button("Copy Path") {
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(bookmark.path, forType: .string)
+                            }
+                        }
+                        .listRowBackground(
+                            RoundedRectangle(cornerRadius: 6)
+                                .fill(isCurrent ? model.accent.opacity(0.22) : Color.clear)
+                                .padding(.horizontal, 6)
+                        )
+                        .help(bookmark.path)
+                    }
+                }
+            }
         }
         .listStyle(.sidebar)
     }
@@ -49,19 +86,28 @@ struct DeviceSidebarView: View {
                 if let device = model.devices.first(where: { $0.serial == model.selectedSerial }) {
                     Text(device.model.replacingOccurrences(of: "_", with: " "))
                         .font(.headline)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
                 }
                 Spacer()
+            }
+
+            VStack(alignment: .leading, spacing: 5) {
+                if let device = model.devices.first(where: { $0.serial == model.selectedSerial }) {
+                    healthChip(title: device.isWireless ? "Wi-Fi ADB" : "USB ADB",
+                               icon: device.transportIcon,
+                               tint: device.isWireless ? .blue : .green)
+                        .help(device.transportName)
+                }
                 if let level = model.deviceStatus.batteryLevel {
-                    HStack(spacing: 3) {
-                        if model.deviceStatus.isCharging {
-                            Image(systemName: "bolt.fill").font(.caption2)
-                        }
-                        Image(systemName: model.deviceStatus.batteryIcon)
-                        Text("\(level)%")
-                            .monospacedDigit()
-                    }
-                    .font(.callout)
-                    .foregroundStyle(model.deviceStatus.isCharging ? model.accent : .secondary)
+                    healthChip(title: "\(level)%",
+                               icon: model.deviceStatus.isCharging ? "bolt.fill" : model.deviceStatus.batteryIcon,
+                               tint: model.deviceStatus.isCharging ? model.accent : .secondary)
+                }
+                if model.rootMode != .unknown {
+                    healthChip(title: model.rootMode.badge,
+                               icon: model.suAvailable ? "lock.open.fill" : "lock",
+                               tint: model.suAvailable ? .orange : .secondary)
                 }
             }
 
@@ -92,6 +138,17 @@ struct DeviceSidebarView: View {
             RoundedRectangle(cornerRadius: 10)
                 .fill(.quaternary.opacity(0.4))
         )
+    }
+
+    private func healthChip(title: String, icon: String, tint: Color) -> some View {
+        Label(title, systemImage: icon)
+            .font(.caption.weight(.semibold))
+            .labelStyle(.titleAndIcon)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Capsule().fill(tint.opacity(0.14)))
+            .foregroundStyle(tint)
     }
 }
 

@@ -147,6 +147,22 @@ struct CommandPaletteView: View {
             PaletteItem(id: "act:reload", icon: "arrow.clockwise", title: "Reload") {
                 model.reload(); close()
             },
+            PaletteItem(id: "act:bookmark", icon: "star", title: "Bookmark This Folder") {
+                model.addBookmarkForCurrentPath(); close()
+            },
+            PaletteItem(id: "act:diagnostics", icon: "stethoscope", title: "Connection Diagnostics…") {
+                model.showDiagnostics(); close()
+            },
+            PaletteItem(id: "act:logcat", icon: "doc.text.magnifyingglass", title: "Logcat…") {
+                model.isLogcatVisible = true
+                if !model.isLogcatRunning { model.startLogcat() }
+                close()
+            },
+            PaletteItem(id: "act:apkmanager", icon: "shippingbox", title: "APK Manager…") {
+                model.isApkManagerVisible = true
+                if model.packages.isEmpty { model.loadPackages() }
+                close()
+            },
         ]
 
         let places = BrowserViewModel.places.map { place in
