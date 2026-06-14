@@ -61,10 +61,30 @@ struct TransferBatch: Identifiable {
         if case .push = kind { return true }
         return false
     }
+
+    var title: String {
+        switch kind {
+        case .pull(let items, _, _):
+            return items.count == 1 ? "Download \(items[0].file.name)" : "Download \(items.count) items"
+        case .push(let items, _):
+            return items.count == 1 ? "Upload \(items[0].destName)" : "Upload \(items.count) items"
+        }
+    }
+
+    var subtitle: String {
+        switch kind {
+        case .pull(_, let dest, _):
+            return dest.path
+        case .push(_, let destDir):
+            return destDir
+        }
+    }
 }
 
 @MainActor
 final class BrowserViewModel: ObservableObject {
+    private static let noisyLogcatTags: Set<String> = ["trusty", "gsp_crypto_proxy_srv"]
+
     static let places: [(name: String, icon: String, path: String)] = [
         ("Internal Storage", "internaldrive", "/sdcard"),
         ("Downloads", "arrow.down.circle", "/sdcard/Download"),
@@ -125,6 +145,9 @@ final class BrowserViewModel: ObservableObject {
     @Published private(set) var navTick = 0
     @Published var isPaletteVisible = false
     @Published var recentPaths: [String] = UserDefaults.standard.stringArray(forKey: "recentPaths") ?? []
+    @Published var bookmarks: [BookmarkedPath] = BrowserViewModel.loadBookmarks() {
+        didSet { BrowserViewModel.saveBookmarks(bookmarks) }
+    }
     @Published var quickLookItem: URL?
     @Published var quickLookItems: [URL] = []
     @Published var usageTree: UsageNode?
@@ -142,6 +165,23 @@ final class BrowserViewModel: ObservableObject {
     @Published var conflictPrompt: ConflictPrompt?
     @Published var apkPrompt: [URL]?
     @Published var isWifiWizardVisible = false
+    @Published var isDiagnosticsVisible = false
+    @Published var isLogcatVisible = false
+    @Published var isApkManagerVisible = false
+    @Published var isHelpVisible = false
+    @Published var diagnostics = ConnectionDiagnostics()
+    @Published var logcatLines: [LogcatLine] = []
+    @Published var logcatFilter = ""
+    @Published var logcatLevel = "All"
+    @Published var quietLogcat = (UserDefaults.standard.object(forKey: "quietLogcat") as? Bool) ?? true {
+        didSet { UserDefaults.standard.set(quietLogcat, forKey: "quietLogcat") }
+    }
+    @Published var isLogcatRunning = false
+    @Published var packages: [AndroidPackage] = []
+    @Published var packageFilter = ""
+    @Published var packageScopeThirdPartyOnly = true
+    @Published var isLoadingPackages = false
+    @Published var isTransferDrawerVisible = false
 
     // Transfer queue
     @Published var activeTransfer: TransferProgress?
@@ -157,6 +197,11 @@ final class BrowserViewModel: ObservableObject {
     private var pollTask: Task<Void, Never>?
     private var trackTask: Task<Void, Never>?
     private var deviceRefreshDebounce: Task<Void, Never>?
+    private var loadTask: Task<Void, Never>?
+    private var logcatTask: Task<Void, Never>?
+    private var packageMetadataTask: Task<Void, Never>?
+    private var wallpaperThemeSignature: String?
+    private var wallpaperThemeHex: String?
 
     var client: AdbClient?
 
@@ -168,6 +213,7 @@ final class BrowserViewModel: ObservableObject {
     var useSu: Bool { rootMode == .su }
     var suAvailable: Bool { rootMode == .su || rootMode == .adbdRoot }
     var queuedTransferCount: Int { max(0, transferBatches.count - 1) }
+    var hasTransfers: Bool { activeTransfer != nil || !transferBatches.isEmpty }
 
     /// True when browsing paths a plain adb shell couldn't reach —
     /// the UI shows an amber keyline as a "you are superuser here" signal.
@@ -203,6 +249,23 @@ final class BrowserViewModel: ObservableObject {
         return list
     }
 
+    var canBookmarkCurrentPath: Bool { !bookmarks.contains(where: { $0.path == currentPath }) }
+
+    var filteredLogcatLines: [LogcatLine] {
+        logcatLines.filter { line in
+            let levelMatches = logcatLevel == "All" || line.level == logcatLevel
+            let textMatches = logcatFilter.isEmpty || line.text.localizedCaseInsensitiveContains(logcatFilter)
+            let quietMatches = !quietLogcat || !Self.noisyLogcatTags.contains(line.tag)
+            return levelMatches && textMatches && quietMatches
+        }
+    }
+
+    var filteredPackages: [AndroidPackage] {
+        packages.filter { package in
+            packageFilter.isEmpty || package.name.localizedCaseInsensitiveContains(packageFilter)
+        }
+    }
+
     var selectedFiles: [RemoteFile] {
         entries.filter { selection.contains($0.id) }
     }
@@ -221,6 +284,9 @@ final class BrowserViewModel: ObservableObject {
         pollTask?.cancel()
         trackTask?.cancel()
         reconnectTask?.cancel()
+        loadTask?.cancel()
+        logcatTask?.cancel()
+        packageMetadataTask?.cancel()
     }
 
     // MARK: - Setup
@@ -250,6 +316,9 @@ final class BrowserViewModel: ObservableObject {
             startDeviceTracking(client: client)
             startReconnectLoop(client: client)
             refreshDevices()
+            if await reconnectWirelessDevices(client: client) {
+                refreshDevices(quiet: true)
+            }
         }
     }
 
@@ -306,32 +375,40 @@ final class BrowserViewModel: ObservableObject {
         reconnectTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(6))
-                guard let self, !self.knownWirelessEndpoints.isEmpty else { continue }
-                // Work off fresh data so we never disturb a healthy connection.
-                let current = (try? await client.listDevices()) ?? []
-                let online = Set(current.filter { $0.isUsable }.map(\.serial))
-
-                // Targets = remembered fixed endpoints PLUS whatever the phone
-                // is advertising right now via mDNS (its port/IP may have
-                // changed since we last saw it, so the live endpoint wins).
-                var targets = Set(self.knownWirelessEndpoints)
-                for svc in await client.mdnsServices() where svc.isConnect {
-                    targets.insert(svc.endpoint)
+                guard let self else { return }
+                if await self.reconnectWirelessDevices(client: client) {
+                    self.refreshDevices(quiet: true)
                 }
-                let missing = targets.subtracting(online)
-                guard !missing.isEmpty else { continue }
-
-                var revived = false
-                for ep in missing {
-                    await client.disconnect(endpoint: ep)   // clear stale/offline state
-                    if (try? await client.connect(endpoint: ep, timeout: 6)) != nil {
-                        revived = true
-                        self.rememberWireless(ep)
-                    }
-                }
-                if revived { self.refreshDevices(quiet: true) }
             }
         }
+    }
+
+    /// Try to reconnect paired Wi-Fi devices immediately or from the polling
+    /// loop. mDNS connect services cover the common case where Android changes
+    /// the wireless debugging port after the app was quit.
+    @discardableResult
+    private func reconnectWirelessDevices(client: AdbClient) async -> Bool {
+        // Work off fresh data so we never disturb a healthy connection.
+        let current = (try? await client.listDevices()) ?? []
+        let online = Set(current.filter { $0.isUsable }.map(\.serial))
+
+        var targets = Set(knownWirelessEndpoints)
+        for svc in await client.mdnsServices() where svc.isConnect {
+            targets.insert(svc.endpoint)
+        }
+
+        let missing = targets.subtracting(online)
+        guard !missing.isEmpty else { return false }
+
+        var revived = false
+        for ep in missing {
+            await client.disconnect(endpoint: ep)   // clear stale/offline state
+            if (try? await client.connect(endpoint: ep, timeout: 6)) != nil {
+                revived = true
+                rememberWireless(ep)
+            }
+        }
+        return revived
     }
 
     /// adb track-devices: refresh the device list the moment something
@@ -451,10 +528,11 @@ final class BrowserViewModel: ObservableObject {
             // Root detection and the first listing race in parallel — /sdcard
             // lists fine without root, so the UI fills immediately.
             async let detected = client.detectRootMode(serial: serial)
-            await self.loadCurrentPath()
+            await self.reloadCurrentPathNow()
             self.rootMode = await detected
+            await self.refreshLiveStatus(client: client, serial: serial)
             if self.lastListingFailed {
-                await self.loadCurrentPath()   // path needed root after all
+                await self.reloadCurrentPathNow()   // path needed root after all
             }
         }
     }
@@ -464,16 +542,40 @@ final class BrowserViewModel: ObservableObject {
     private func startPolling(client: AdbClient, serial: String) {
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
-                let status = await client.fetchStatus(serial: serial)
                 guard let self, !Task.isCancelled else { return }
-                self.deviceStatus = status
-                let newTheme = DeviceTheme.from(hex: status.seedHex)
-                if newTheme != self.theme {
-                    withAnimation(.easeInOut(duration: 0.8)) { self.theme = newTheme }
-                }
+                await self.refreshLiveStatus(client: client, serial: serial)
                 try? await Task.sleep(for: .seconds(30))
             }
         }
+    }
+
+    private func refreshLiveStatus(client: AdbClient, serial: String) async {
+        var status = await client.fetchStatus(serial: serial)
+        if status.seedSource == "preset" || status.seedHex == nil {
+            status.seedHex = await wallpaperSeedHex(client: client, serial: serial) ?? status.seedHex
+        }
+        deviceStatus = status
+        let newTheme = DeviceTheme.from(hex: status.seedHex)
+        if newTheme != theme {
+            withAnimation(.easeInOut(duration: 0.8)) { theme = newTheme }
+        }
+    }
+
+    private func wallpaperSeedHex(client: AdbClient, serial: String) async -> String? {
+        guard let signature = await client.wallpaperSignature(serial: serial, suAvailable: suAvailable) else {
+            return wallpaperThemeHex
+        }
+        if signature == wallpaperThemeSignature {
+            return wallpaperThemeHex
+        }
+        let dir = Self.makeTempDir()
+        guard let url = try? await client.pullWallpaper(to: dir, serial: serial, suAvailable: suAvailable),
+              let hex = Self.averageImageHex(at: url) else {
+            return wallpaperThemeHex
+        }
+        wallpaperThemeSignature = signature
+        wallpaperThemeHex = hex
+        return hex
     }
 
     // MARK: - Navigation
@@ -481,7 +583,7 @@ final class BrowserViewModel: ObservableObject {
     func navigate(to rawPath: String, direction: NavDirection? = nil) {
         isEditingPath = false
         let path = normalize(rawPath)
-        guard path != currentPath else { Task { await loadCurrentPath() }; return }
+        guard path != currentPath else { scheduleLoadCurrentPath(); return }
         // Going to an ancestor should zoom out, not in (breadcrumbs, places).
         let inferred: NavDirection = currentPath.hasPrefix(path == "/" ? "/" : path + "/") ? .backward : .forward
         backStack.append(currentPath)
@@ -514,12 +616,12 @@ final class BrowserViewModel: ObservableObject {
         // NSTableView-backed Table left ghost views that swallowed clicks.
         // The zoom effect is a transform pulse in ContentView instead.
         currentPath = path
-        Task { await loadCurrentPath() }
+        scheduleLoadCurrentPath()
     }
 
     func reload() {
         invalidateListing()
-        Task { await loadCurrentPath() }
+        scheduleLoadCurrentPath()
     }
 
     /// Double-click: descend into directories (resolving symlinks), open files.
@@ -569,8 +671,12 @@ final class BrowserViewModel: ObservableObject {
             entries = cached
             applySelectionAfterLoad()
             do {
+                try Task.checkCancellation()
                 let fresh = try await client.list(path: path, serial: serial, su: useSu)
+                try Task.checkCancellation()
                 storeListing(fresh, key: key, path: path)
+            } catch is CancellationError {
+                return
             } catch let e as AdbError {
                 lastListingFailed = true
                 error = e
@@ -579,14 +685,30 @@ final class BrowserViewModel: ObservableObject {
         }
 
         await withStatus("Loading \(path)…") {
+            try Task.checkCancellation()
             do {
                 let fresh = try await client.list(path: path, serial: serial, su: self.useSu)
+                try Task.checkCancellation()
                 self.storeListing(fresh, key: key, path: path)
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
                 self.lastListingFailed = true
                 throw error
             }
         }
+    }
+
+    private func scheduleLoadCurrentPath() {
+        loadTask?.cancel()
+        loadTask = Task { [weak self] in
+            await self?.loadCurrentPath()
+        }
+    }
+
+    private func reloadCurrentPathNow() async {
+        loadTask?.cancel()
+        await loadCurrentPath()
     }
 
     private func storeListing(_ fresh: [RemoteFile], key: String, path: String) {
@@ -614,12 +736,193 @@ final class BrowserViewModel: ObservableObject {
         UserDefaults.standard.set(recentPaths, forKey: "recentPaths")
     }
 
+    func addBookmarkForCurrentPath() {
+        guard !bookmarks.contains(where: { $0.path == currentPath }) else { return }
+        bookmarks.append(BookmarkedPath(name: Self.defaultBookmarkName(for: currentPath), path: currentPath))
+        bookmarks.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
+
+    func removeBookmark(_ path: String) {
+        bookmarks.removeAll { $0.path == path }
+    }
+
+    func renameBookmark(_ bookmark: BookmarkedPath) {
+        let alert = NSAlert()
+        alert.messageText = "Rename Favorite"
+        alert.informativeText = bookmark.path
+        alert.addButton(withTitle: "Rename")
+        alert.addButton(withTitle: "Cancel")
+        let field = NSTextField(string: bookmark.name)
+        field.frame = NSRect(x: 0, y: 0, width: 280, height: 24)
+        alert.accessoryView = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let name = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, let idx = bookmarks.firstIndex(where: { $0.path == bookmark.path }) else { return }
+        bookmarks[idx].name = name
+        bookmarks.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
+
     private func normalize(_ raw: String) -> String {
         var p = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         if p.isEmpty { p = "/" }
         if !p.hasPrefix("/") { p = "/" + p }
         while p.count > 1 && p.hasSuffix("/") { p.removeLast() }
         return p
+    }
+
+    private static func defaultBookmarkName(for path: String) -> String {
+        let name = (path as NSString).lastPathComponent
+        return name.isEmpty ? path : name
+    }
+
+    private static func loadBookmarks() -> [BookmarkedPath] {
+        if let data = UserDefaults.standard.data(forKey: "bookmarkedPaths"),
+           let decoded = try? JSONDecoder().decode([BookmarkedPath].self, from: data) {
+            return decoded
+        }
+        return (UserDefaults.standard.stringArray(forKey: "bookmarks") ?? []).map {
+            BookmarkedPath(name: defaultBookmarkName(for: $0), path: $0)
+        }
+    }
+
+    private static func saveBookmarks(_ bookmarks: [BookmarkedPath]) {
+        if let data = try? JSONEncoder().encode(bookmarks) {
+            UserDefaults.standard.set(data, forKey: "bookmarkedPaths")
+        }
+        UserDefaults.standard.set(bookmarks.map(\.path), forKey: "bookmarks")
+    }
+
+    // MARK: - Tools
+
+    func refreshDiagnostics() {
+        guard let client else { return }
+        Task {
+            diagnostics = await client.diagnostics(knownWirelessEndpoints: knownWirelessEndpoints)
+        }
+    }
+
+    func showDiagnostics() {
+        isDiagnosticsVisible = true
+        refreshDiagnostics()
+    }
+
+    func startLogcat() {
+        guard let client, let serial = selectedSerial else { return }
+        logcatTask?.cancel()
+        logcatLines = []
+        isLogcatRunning = true
+        logcatTask = Task { [weak self] in
+            for await line in client.logcat(serial: serial) {
+                guard let self, !Task.isCancelled else { return }
+                self.logcatLines.append(LogcatLine(text: line))
+                if self.logcatLines.count > 3000 {
+                    self.logcatLines.removeFirst(self.logcatLines.count - 3000)
+                }
+            }
+            self?.isLogcatRunning = false
+        }
+    }
+
+    func stopLogcat() {
+        logcatTask?.cancel()
+        logcatTask = nil
+        isLogcatRunning = false
+    }
+
+    func clearLogcat() {
+        guard let client, let serial = selectedSerial else { return }
+        logcatLines = []
+        Task { await client.clearLogcat(serial: serial) }
+    }
+
+    func loadPackages() {
+        guard let client, let serial = selectedSerial else { return }
+        packageMetadataTask?.cancel()
+        isLoadingPackages = true
+        Task {
+            do {
+                packages = try await client.listPackages(serial: serial, thirdPartyOnly: packageScopeThirdPartyOnly)
+                enrichPackages(client: client, serial: serial)
+            } catch let e as AdbError {
+                error = e
+            } catch {
+                self.error = AdbError(message: error.localizedDescription)
+            }
+            isLoadingPackages = false
+        }
+    }
+
+    private func enrichPackages(client: AdbClient, serial: String) {
+        packageMetadataTask = Task { [weak self] in
+            guard let self else { return }
+            let snapshot = self.packages
+            for package in snapshot {
+                guard !Task.isCancelled else { return }
+                let enriched = await client.enrichPackage(package, serial: serial)
+                guard !Task.isCancelled else { return }
+                if let index = self.packages.firstIndex(where: { $0.id == enriched.id }) {
+                    self.packages[index] = enriched
+                }
+            }
+        }
+    }
+
+    func launchPackage(_ package: AndroidPackage) {
+        guard let client, let serial = selectedSerial else { return }
+        Task {
+            await withStatus("Launching \(package.shortName)…") {
+                try await client.launchPackage(package.name, serial: serial)
+            }
+        }
+    }
+
+    func forceStopPackage(_ package: AndroidPackage) {
+        guard let client, let serial = selectedSerial else { return }
+        Task {
+            await withStatus("Stopping \(package.shortName)…") {
+                try await client.forceStopPackage(package.name, serial: serial)
+            }
+        }
+    }
+
+    func clearPackageData(_ package: AndroidPackage) {
+        guard let client, let serial = selectedSerial else { return }
+        Task {
+            await withStatus("Clearing \(package.shortName)…") {
+                try await client.clearPackageData(package.name, serial: serial)
+            }
+        }
+    }
+
+    func uninstallPackage(_ package: AndroidPackage) {
+        guard let client, let serial = selectedSerial else { return }
+        Task {
+            await withStatus("Uninstalling \(package.shortName)…") {
+                try await client.uninstallPackage(package.name, serial: serial)
+            }
+            packages.removeAll { $0.id == package.id }
+        }
+    }
+
+    func pullApk(_ package: AndroidPackage) {
+        guard let client, let serial = selectedSerial else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.prompt = "Save APK"
+        panel.message = "Choose where to save \(package.shortName).apk"
+        guard panel.runModal() == .OK, let dir = panel.url else { return }
+        Task {
+            await withStatus("Pulling \(package.shortName).apk…") {
+                try await client.pull(remotePath: package.apkPath,
+                                      fileName: package.shortName + ".apk",
+                                      destName: package.shortName + ".apk",
+                                      toLocalDir: dir,
+                                      serial: serial,
+                                      suAvailable: self.suAvailable)
+            }
+        }
     }
 
     // MARK: - File operations
@@ -876,7 +1179,7 @@ final class BrowserViewModel: ObservableObject {
         }
         let dir = Self.makeTempDir()
         statusMessage = "Exporting \(file.name)…"
-        defer { statusMessage = "" }
+        defer { statusMessage = "Downloaded \(file.name) to Finder" }
         try await client.pull(remotePath: file.path, fileName: file.name,
                               toLocalDir: dir, serial: serial, suAvailable: suAvailable)
         return dir.appendingPathComponent(file.name)
@@ -888,6 +1191,51 @@ final class BrowserViewModel: ObservableObject {
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         try? FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
         return tmp
+    }
+
+    private static func averageImageHex(at url: URL) -> String? {
+        guard let image = NSImage(contentsOf: url),
+              let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil),
+              let data = cg.dataProvider?.data,
+              let bytes = CFDataGetBytePtr(data) else { return nil }
+
+        let width = cg.width
+        let height = cg.height
+        let bytesPerRow = cg.bytesPerRow
+        let bytesPerPixel = max(1, cg.bitsPerPixel / 8)
+        let sampleStep = max(1, min(width, height) / 80)
+        var red = 0.0, green = 0.0, blue = 0.0, count = 0.0
+
+        for y in stride(from: 0, to: height, by: sampleStep) {
+            for x in stride(from: 0, to: width, by: sampleStep) {
+                let offset = y * bytesPerRow + x * bytesPerPixel
+                guard offset + 2 < CFDataGetLength(data) else { continue }
+                let r: UInt8
+                let g: UInt8
+                let b: UInt8
+                if cg.bitmapInfo.contains(.byteOrder32Little), bytesPerPixel >= 4 {
+                    b = bytes[offset]
+                    g = bytes[offset + 1]
+                    r = bytes[offset + 2]
+                } else {
+                    r = bytes[offset]
+                    g = bytes[offset + 1]
+                    b = bytes[offset + 2]
+                }
+                let brightness = (Double(r) + Double(g) + Double(b)) / (3.0 * 255.0)
+                // Avoid letting very dark or blown-out wallpaper areas dominate.
+                guard brightness > 0.08, brightness < 0.94 else { continue }
+                red += Double(r)
+                green += Double(g)
+                blue += Double(b)
+                count += 1
+            }
+        }
+        guard count > 0 else { return nil }
+        return String(format: "%02X%02X%02X",
+                      Int(red / count).clampedByte,
+                      Int(green / count).clampedByte,
+                      Int(blue / count).clampedByte)
     }
 
     static func availableName(_ name: String, existing: Set<String>) -> String {
@@ -1166,4 +1514,8 @@ final class BrowserViewModel: ObservableObject {
             self.error = AdbError(message: error.localizedDescription)
         }
     }
+}
+
+private extension Int {
+    var clampedByte: Int { Swift.max(0, Swift.min(255, self)) }
 }

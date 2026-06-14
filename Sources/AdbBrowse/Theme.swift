@@ -8,6 +8,7 @@ struct DeviceStatus: Equatable {
     var freeBytes: Int64?
     var totalBytes: Int64?
     var seedHex: String?
+    var seedSource: String?
 
     static let empty = DeviceStatus()
 
