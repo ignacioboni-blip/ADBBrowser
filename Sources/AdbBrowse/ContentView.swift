@@ -202,32 +202,25 @@ struct ContentView: View {
     @FocusState private var filterFocused: Bool
 
     private var filterBar: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "line.3.horizontal.decrease.circle")
-                .foregroundStyle(model.filterText.isEmpty ? Color.secondary : model.accent)
-            TextField("Filter this folder (⌘F)", text: $model.filterText)
-                .textFieldStyle(.plain)
-                .focused($filterFocused)
-                .onExitCommand {
-                    model.filterText = ""
-                    filterFocused = false
-                }
+        SearchPillField(
+            icon: "line.3.horizontal.decrease.circle",
+            placeholder: "Filter this folder (⌘F)",
+            text: $model.filterText,
+            tint: model.accent,
+            focused: $filterFocused,
+            onExit: {
+                model.filterText = ""
+                filterFocused = false
+            }
+        ) {
             if !model.filterText.isEmpty {
                 Text("\(model.visibleEntries.count) of \(model.entries.count)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
-                Button {
-                    model.filterText = ""
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain)
             }
         }
-        .font(.callout)
-        .padding(.horizontal, 12)
+        .padding(.horizontal, 10)
         .padding(.vertical, 6)
         .background(.bar)
         .onChange(of: model.filterFocusRequest) { _, _ in
@@ -275,11 +268,15 @@ struct ContentView: View {
         }
         .overlay {
             if isDropTargeted {
-                RoundedRectangle(cornerRadius: 8)
-                    .strokeBorder(model.accent, lineWidth: 3)
-                    .background(model.accent.opacity(0.08))
-                    .padding(4)
+                RoundedRectangle(cornerRadius: DS.cornerLarge, style: .continuous)
+                    .strokeBorder(model.accent, style: StrokeStyle(lineWidth: 2.5, dash: [8, 6]))
+                    .background(
+                        RoundedRectangle(cornerRadius: DS.cornerLarge, style: .continuous)
+                            .fill(model.accent.opacity(DS.tonalFaint))
+                    )
+                    .padding(6)
                     .allowsHitTesting(false)
+                    .transition(.opacity)
             }
         }
     }
@@ -528,27 +525,28 @@ struct ContentView: View {
     // MARK: - Empty states
 
     private var adbMissingView: some View {
-        ContentUnavailableView {
-            Label("adb Not Found", systemImage: "exclamationmark.triangle")
-        } description: {
-            Text("Couldn't locate the adb binary. Set its path in Settings (⌘,) — usually ~/Library/Android/sdk/platform-tools/adb.")
-        } actions: {
+        EmptyStateView(
+            icon: "exclamationmark.triangle",
+            title: "adb Not Found",
+            message: "Couldn't locate the adb binary. Set its path in Settings (⌘,) — usually ~/Library/Android/sdk/platform-tools/adb.",
+            tint: .orange
+        ) {
             Button("Try Again") { model.start() }
+                .buttonStyle(.borderedProminent)
         }
-        .frame(maxHeight: .infinity)
     }
 
     private var noDeviceView: some View {
-        ContentUnavailableView {
-            Label("No Device Connected", systemImage: "iphone.slash")
-        } description: {
-            Text("Plug in your phone and make sure USB debugging is authorized — or connect wirelessly.")
-        } actions: {
+        EmptyStateView(
+            icon: "iphone.slash",
+            title: "No Device Connected",
+            message: "Plug in your phone and make sure USB debugging is authorized — or connect wirelessly.",
+            tint: model.accent
+        ) {
             Button("Connect over Wi-Fi…") { model.isWifiWizardVisible = true }
                 .buttonStyle(.borderedProminent)
             Button("Refresh") { model.refreshDevices() }
         }
-        .frame(maxHeight: .infinity)
     }
 
     // MARK: - Sheets
@@ -693,9 +691,14 @@ struct NameInputSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text(title).font(.headline)
+            HStack(spacing: 10) {
+                TonalIconBadge(icon: buttonLabel == "Create" ? "folder.badge.plus" : "pencil",
+                               tint: .accentColor, side: 30)
+                Text(title).font(.headline)
+            }
             TextField("Name", text: $text)
                 .textFieldStyle(.roundedBorder)
+                .controlSize(.large)
                 .frame(width: 300)
                 .onSubmit(commit)
             HStack {
@@ -704,6 +707,7 @@ struct NameInputSheet: View {
                     .keyboardShortcut(.cancelAction)
                 Button(buttonLabel, action: commit)
                     .keyboardShortcut(.defaultAction)
+                    .buttonStyle(.borderedProminent)
                     .disabled(text.trimmingCharacters(in: .whitespaces).isEmpty || text.contains("/"))
             }
         }
