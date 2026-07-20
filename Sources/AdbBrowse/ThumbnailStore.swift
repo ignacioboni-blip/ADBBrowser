@@ -42,9 +42,15 @@ final class ThumbnailStore {
         let diskURL = diskDir.appendingPathComponent(key + ".png")
         let limiter = self.limiter
         let task = Task<NSImage?, Never> {
-            if let onDisk = NSImage(contentsOf: diskURL) { return onDisk }
+            // Decode the disk cache off the main actor — NSImage(contentsOf:)
+            // does file I/O + PNG decode, which janks scrolling if run here.
+            if let onDisk = await Task.detached(priority: .utility, operation: {
+                NSImage(contentsOf: diskURL)
+            }).value {
+                return onDisk
+            }
 
-            await limiter.acquire()
+            guard await limiter.acquire() else { return nil }
             let tmp = FileManager.default.temporaryDirectory
                 .appendingPathComponent("AdbBrowse/thumb-src", isDirectory: true)
                 .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -95,27 +101,52 @@ final class ThumbnailStore {
     }
 }
 
-/// Counting semaphore for async tasks.
+/// Counting semaphore for async tasks. Waiting is cancellation-aware:
+/// `acquire()` returns `false` — without consuming a slot — if the task is
+/// cancelled first, so a queue of stale work (e.g. listings for folders the
+/// user already navigated away from) drains instantly instead of executing.
 actor ConcurrencyLimiter {
     private var available: Int
-    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var waiters: [(id: UUID, continuation: CheckedContinuation<Bool, Never>)] = []
+    private var cancelledIDs: Set<UUID> = []
 
     init(slots: Int) {
         available = slots
     }
 
-    func acquire() async {
+    /// True when a slot was acquired (caller must `release()`);
+    /// false when the task was cancelled while waiting.
+    func acquire() async -> Bool {
+        let id = UUID()
+        let acquired = await withTaskCancellationHandler {
+            await wait(id: id)
+        } onCancel: {
+            Task { await self.cancelWaiter(id) }
+        }
+        cancelledIDs.remove(id)   // tidy the raced cancel-after-acquire case
+        return acquired
+    }
+
+    private func wait(id: UUID) async -> Bool {
+        if cancelledIDs.remove(id) != nil || Task.isCancelled { return false }
         if available > 0 {
             available -= 1
-            return
+            return true
         }
-        await withCheckedContinuation { waiters.append($0) }
+        return await withCheckedContinuation { waiters.append((id, $0)) }
+    }
+
+    private func cancelWaiter(_ id: UUID) {
+        if let idx = waiters.firstIndex(where: { $0.id == id }) {
+            waiters.remove(at: idx).continuation.resume(returning: false)
+        } else {
+            cancelledIDs.insert(id)
+        }
     }
 
     func release() {
-        if let next = waiters.first {
-            waiters.removeFirst()
-            next.resume()
+        if !waiters.isEmpty {
+            waiters.removeFirst().continuation.resume(returning: true)
         } else {
             available += 1
         }

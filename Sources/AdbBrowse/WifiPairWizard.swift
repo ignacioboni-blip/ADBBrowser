@@ -33,6 +33,7 @@ struct WifiPairWizard: View {
     @State private var busy = false
     @State private var errorText: String?
     @State private var discoveredHost: String?
+    @State private var alreadyPaired: MdnsService?
     @State private var qr: QrPairing?
     @State private var qrImage: NSImage?
     @State private var qrWaiting = false
@@ -103,7 +104,38 @@ struct WifiPairWizard: View {
             instruction(1, "Open Settings ▸ Developer options ▸ Wireless debugging and turn it on.")
             instruction(2, "Tap “Pair device with QR code” (or “…with pairing code”).")
             instruction(3, "On the next screen you'll either scan a code or read off an address and number.")
+            if let svc = alreadyPaired {
+                Divider()
+                HStack(alignment: .top, spacing: 10) {
+                    Image(systemName: "checkmark.seal.fill")
+                        .foregroundStyle(model.accent)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("A device is broadcasting wireless debugging at \(svc.endpoint).")
+                            .fixedSize(horizontal: false, vertical: true)
+                        Text("If it's already paired with this Mac, you can skip pairing.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("Connect") {
+                        connectEndpoint = svc.endpoint
+                        advanceTo(.connect)
+                        doConnect()
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+            }
         }
+        .task { await scanForAlreadyPaired() }
+    }
+
+    /// Pairing survives on Android — if the phone is already broadcasting a
+    /// connect service, the user shouldn't be forced through pairing again.
+    private func scanForAlreadyPaired() async {
+        await model.ensureWirelessReady()
+        let services = await model.mdnsScan()
+        guard step == .prepare else { return }
+        alreadyPaired = services.first(where: { $0.isConnect })
     }
 
     private var pairStep: some View {

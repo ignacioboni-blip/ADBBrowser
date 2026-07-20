@@ -278,20 +278,28 @@ struct AndroidPackage: Identifiable, Hashable {
 struct LogcatLine: Identifiable, Hashable {
     let id = UUID()
     let text: String
+    let level: String
+    let tag: String
 
-    var level: String {
+    /// threadtime format: "MM-DD HH:MM:SS.mmm  PID  TID LEVEL TAG: message".
+    /// Level and tag are parsed once here — they're read on every filter pass.
+    /// The tag is everything between the level field and the first colon
+    /// after it (splitting the whole line on ":" broke on timestamps and on
+    /// messages containing colons, so the Quiet filter missed lines).
+    init(text: String) {
+        self.text = text
         let parts = text.split(separator: " ", omittingEmptySubsequences: true)
-        guard parts.count > 4 else { return "" }
-        return String(parts[4])
-    }
-
-    var tag: String {
-        let pieces = text.split(separator: ":")
-        guard pieces.count > 1 else { return "" }
-        return pieces.dropLast().last?
-            .split(separator: " ", omittingEmptySubsequences: true)
-            .last
-            .map(String.init) ?? ""
+        level = parts.count > 4 ? String(parts[4]) : ""
+        if parts.count > 5 {
+            let afterLevel = parts[5...].joined(separator: " ")
+            if let colon = afterLevel.firstIndex(of: ":") {
+                tag = String(afterLevel[..<colon]).trimmingCharacters(in: .whitespaces)
+            } else {
+                tag = ""
+            }
+        } else {
+            tag = ""
+        }
     }
 }
 

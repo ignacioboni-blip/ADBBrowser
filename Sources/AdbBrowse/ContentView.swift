@@ -8,7 +8,6 @@ struct ContentView: View {
     @State private var sheet: SheetMode?
     @State private var isDropTargeted = false
     @State private var sidebarVisibility = NavigationSplitViewVisibility.all
-    @State private var flights: [FlightOverlay.Flight] = []
 
     enum SheetMode: Identifiable {
         case newFolder
@@ -43,7 +42,7 @@ struct ContentView: View {
                 HelpView()
             }
             .sheet(isPresented: $model.isTransferDrawerVisible) {
-                TransferDrawerView(model: model)
+                TransferDrawerView(model: model, transfers: model.transfers)
             }
             .alert(item: $model.error) { err in
                 Alert(title: Text("adb Error"), message: Text(err.message), dismissButton: .default(Text("OK")))
@@ -103,15 +102,7 @@ struct ContentView: View {
         .tint(model.accent)
         .quickLookPreview($model.quickLookItem, in: model.quickLookItems)
         .toolbar { toolbarContent }
-        .overlay(FlightOverlay(flights: flights, accent: model.accent))
-        .onChange(of: model.flightTrigger) { _, trigger in
-            let flight = FlightOverlay.Flight(id: trigger, isUpload: model.flightIsUpload)
-            flights.append(flight)
-            Task {
-                try? await Task.sleep(for: .seconds(1.0))
-                flights.removeAll { $0.id == flight.id }
-            }
-        }
+        .overlay(FlightOverlayHost(transfers: model.transfers, accent: model.accent))
     }
 
     private var deleteConfirmShown: Binding<Bool> {
@@ -163,7 +154,7 @@ struct ContentView: View {
                 }
                 mainArea
                 Divider()
-                statusBar
+                StatusBarView(model: model, transfers: model.transfers)
             }
             if model.inRootTerritory {
                 Rectangle()
@@ -388,17 +379,22 @@ struct ContentView: View {
     }
 
     private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
-        var urls: [URL] = []
+        var urls: [URL] = []   // only touched on the main queue
         let group = DispatchGroup()
         for provider in providers where provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
             group.enter()
             provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier) { item, _ in
-                defer { group.leave() }
-                if let data = item as? Data,
-                   let url = URL(dataRepresentation: data, relativeTo: nil) {
-                    urls.append(url)
-                } else if let url = item as? URL {
-                    urls.append(url)
+                let url: URL?
+                if let data = item as? Data {
+                    url = URL(dataRepresentation: data, relativeTo: nil)
+                } else {
+                    url = item as? URL
+                }
+                // Completion handlers arrive on arbitrary queues; hop to main
+                // so concurrent drops can't race on the array.
+                DispatchQueue.main.async {
+                    if let url { urls.append(url) }
+                    group.leave()
                 }
             }
         }
@@ -529,94 +525,6 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - Status bar
-
-    private var statusBar: some View {
-        HStack(spacing: 10) {
-            if let transfer = model.activeTransfer {
-                Image(systemName: transfer.isUpload ? "arrow.up.circle.fill" : "arrow.down.circle.fill")
-                    .foregroundStyle(model.accent)
-                Text(transfer.name)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .frame(maxWidth: 220, alignment: .leading)
-                if let fraction = transfer.fraction {
-                    ProgressView(value: fraction)
-                        .frame(width: 140)
-                        .tint(model.accent)
-                } else {
-                    ProgressView().controlSize(.small)
-                }
-                if !transfer.speed.isEmpty {
-                    Text(transfer.speed)
-                        .monospacedDigit()
-                        .fontWeight(.medium)
-                }
-                if let counter = transfer.counter {
-                    Text(counter).foregroundStyle(.tertiary)
-                }
-                Button {
-                    model.cancelCurrentTransfer()
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain)
-                .help("Cancel this transfer")
-                if model.queuedTransferCount > 0 {
-                    Button {
-                        model.isTransferDrawerVisible = true
-                    } label: {
-                        Label("+\(model.queuedTransferCount)", systemImage: "tray.full")
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.tertiary)
-                    .help("Show transfer queue")
-                }
-            } else if model.isBusy {
-                ProgressView().controlSize(.small)
-                Text(model.statusMessage).foregroundStyle(.secondary)
-            } else if !model.statusMessage.isEmpty {
-                Text(model.statusMessage).foregroundStyle(.secondary)
-            } else {
-                Text("\(model.visibleEntries.count) items"
-                     + (model.selection.isEmpty ? "" : ", \(model.selection.count) selected"))
-                    .foregroundStyle(.secondary)
-            }
-            Spacer()
-            if model.hasTransfers {
-                Button {
-                    model.isTransferDrawerVisible = true
-                } label: {
-                    Image(systemName: "tray.full")
-                }
-                .buttonStyle(.plain)
-                .help("Show transfers")
-            }
-            if model.selectedSerial != nil {
-                Label(model.rootMode.badge, systemImage: model.suAvailable ? "lock.open.fill" : "lock")
-                    .font(.caption)
-                    .fontWeight(.medium)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 3)
-                    .background(Capsule().fill(
-                        model.inRootTerritory ? Color.orange.opacity(0.32)
-                            : model.suAvailable ? Color.orange.opacity(0.16)
-                            : Color.gray.opacity(0.12)
-                    ))
-                    .foregroundStyle(model.suAvailable ? Color.orange : Color.secondary)
-                    .shadow(color: model.inRootTerritory ? .orange.opacity(0.45) : .clear, radius: 5)
-                    .help(model.inRootTerritory
-                          ? "Superuser territory — this path is invisible to a plain adb shell"
-                          : "How file operations are executed on the device")
-            }
-        }
-        .font(.callout)
-        .padding(.horizontal, 12)
-        .padding(.vertical, 5)
-        .background(.bar)
-    }
-
     // MARK: - Empty states
 
     private var adbMissingView: some View {
@@ -657,6 +565,120 @@ struct ContentView: View {
                 model.rename(file, to: name)
             }
         }
+    }
+}
+
+/// Hosts the transfer flight animation. Observes TransferCenter directly so
+/// enqueue pulses fire without re-rendering the whole window.
+private struct FlightOverlayHost: View {
+    @ObservedObject var transfers: TransferCenter
+    let accent: Color
+
+    @State private var flights: [FlightOverlay.Flight] = []
+
+    var body: some View {
+        FlightOverlay(flights: flights, accent: accent)
+            .onChange(of: transfers.flightTrigger) { _, trigger in
+                let flight = FlightOverlay.Flight(id: trigger, isUpload: transfers.flightIsUpload)
+                flights.append(flight)
+                Task {
+                    try? await Task.sleep(for: .seconds(1.0))
+                    flights.removeAll { $0.id == flight.id }
+                }
+            }
+    }
+}
+
+/// The bottom status bar. Split into its own view so 400 ms transfer-progress
+/// ticks re-render only this strip, not the file table above it.
+private struct StatusBarView: View {
+    @ObservedObject var model: BrowserViewModel
+    @ObservedObject var transfers: TransferCenter
+
+    var body: some View {
+        HStack(spacing: 10) {
+            if let transfer = transfers.active {
+                Image(systemName: transfer.isUpload ? "arrow.up.circle.fill" : "arrow.down.circle.fill")
+                    .foregroundStyle(model.accent)
+                Text(transfer.name)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .frame(maxWidth: 220, alignment: .leading)
+                if let fraction = transfer.fraction {
+                    ProgressView(value: fraction)
+                        .frame(width: 140)
+                        .tint(model.accent)
+                } else {
+                    ProgressView().controlSize(.small)
+                }
+                if !transfer.speed.isEmpty {
+                    Text(transfer.speed)
+                        .monospacedDigit()
+                        .fontWeight(.medium)
+                }
+                if let counter = transfer.counter {
+                    Text(counter).foregroundStyle(.tertiary)
+                }
+                Button {
+                    model.cancelCurrentTransfer()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Cancel this transfer")
+                if transfers.queuedCount > 0 {
+                    Button {
+                        model.isTransferDrawerVisible = true
+                    } label: {
+                        Label("+\(transfers.queuedCount)", systemImage: "tray.full")
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.tertiary)
+                    .help("Show transfer queue")
+                }
+            } else if model.isBusy {
+                ProgressView().controlSize(.small)
+                Text(model.statusMessage).foregroundStyle(.secondary)
+            } else if !model.statusMessage.isEmpty {
+                Text(model.statusMessage).foregroundStyle(.secondary)
+            } else {
+                Text("\(model.visibleEntries.count) items"
+                     + (model.selection.isEmpty ? "" : ", \(model.selection.count) selected"))
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            if transfers.hasAny {
+                Button {
+                    model.isTransferDrawerVisible = true
+                } label: {
+                    Image(systemName: "tray.full")
+                }
+                .buttonStyle(.plain)
+                .help("Show transfers")
+            }
+            if model.selectedSerial != nil {
+                Label(model.rootMode.badge, systemImage: model.suAvailable ? "lock.open.fill" : "lock")
+                    .font(.caption)
+                    .fontWeight(.medium)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(Capsule().fill(
+                        model.inRootTerritory ? Color.orange.opacity(0.32)
+                            : model.suAvailable ? Color.orange.opacity(0.16)
+                            : Color.gray.opacity(0.12)
+                    ))
+                    .foregroundStyle(model.suAvailable ? Color.orange : Color.secondary)
+                    .shadow(color: model.inRootTerritory ? .orange.opacity(0.45) : .clear, radius: 5)
+                    .help(model.inRootTerritory
+                          ? "Superuser territory — this path is invisible to a plain adb shell"
+                          : "How file operations are executed on the device")
+            }
+        }
+        .font(.callout)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 5)
+        .background(.bar)
     }
 }
 

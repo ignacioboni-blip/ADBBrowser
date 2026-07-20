@@ -23,8 +23,11 @@ actor DeviceShell {
     }
 
     func run(_ command: String, timeout: TimeInterval) async throws -> ShellResult {
-        await queue.acquire()
+        // Cancellation-aware: a burst of navigations doesn't leave a backlog
+        // of obsolete commands each holding the shell in turn.
+        guard await queue.acquire() else { throw CancellationError() }
         do {
+            try Task.checkCancellation()
             let result = try await execute(command, timeout: timeout)
             await queue.release()
             return result
@@ -71,8 +74,19 @@ actor DeviceShell {
 
     /// Look for "<marker><exitcode>\n" in the buffer; on success consume it
     /// and return everything before it (minus the newline our `echo` added).
+    /// `scanFrom` remembers how far we've already looked so multi-megabyte
+    /// outputs (du -a) aren't rescanned from the start on every chunk.
+    private var scanFrom = 0
+
     private func parse(marker: Data) -> ShellResult? {
-        guard let markerRange = buffer.range(of: marker) else { return nil }
+        let searchStart = min(max(buffer.startIndex, scanFrom), buffer.endIndex)
+        guard let markerRange = buffer.range(of: marker, in: searchStart..<buffer.endIndex) else {
+            // Back off marker-length bytes so a marker split across chunks is
+            // still found by the next scan.
+            scanFrom = max(buffer.startIndex, buffer.endIndex - marker.count + 1)
+            return nil
+        }
+        scanFrom = markerRange.lowerBound   // hold position until the exit-code newline arrives
         let afterMarker = buffer[markerRange.upperBound...]
         guard let newline = afterMarker.firstIndex(of: UInt8(ascii: "\n")) else { return nil }
 
@@ -82,6 +96,7 @@ actor DeviceShell {
         var output = buffer[..<markerRange.lowerBound]
         if output.last == UInt8(ascii: "\n") { output = output.dropLast() }   // our echo
         buffer = Data(buffer[buffer.index(after: newline)...])
+        scanFrom = 0
 
         // stderr is merged into stdout at the fd level, preserving order.
         return ShellResult(
@@ -171,16 +186,25 @@ actor DeviceShell {
         try? stdin?.close()
         stdin = nil
         buffer = Data()
+        scanFrom = 0
         streamEnded = false
     }
 }
 
-/// One persistent shell per (device, su) pair.
+/// Which persistent shell a command runs on. Interactive commands (ls, stat,
+/// quick file ops) get their own shell so they never queue behind long-running
+/// bulk work (du for the sunburst, find, recursive copies) — previously a
+/// storage measurement could block folder navigation for minutes.
+enum ShellLane: String, Sendable {
+    case interactive, bulk
+}
+
+/// One persistent shell per (device, su, lane) triple.
 actor ShellPool {
     private var shells: [String: DeviceShell] = [:]
 
-    func shell(adbPath: String, serial: String, su: Bool) -> DeviceShell {
-        let key = "\(serial)|\(su ? "su" : "sh")"
+    func shell(adbPath: String, serial: String, su: Bool, lane: ShellLane) -> DeviceShell {
+        let key = "\(serial)|\(su ? "su" : "sh")|\(lane.rawValue)"
         if let existing = shells[key] { return existing }
         let fresh = DeviceShell(adbPath: adbPath, serial: serial, su: su)
         shells[key] = fresh
