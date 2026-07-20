@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 enum ViewMode: String {
     case list, grid, sunburst
@@ -81,6 +82,25 @@ struct TransferBatch: Identifiable {
     }
 }
 
+/// Fast-changing transfer state, split out of BrowserViewModel so the
+/// progress-monitor ticks (every 400–900 ms during a transfer) only
+/// re-render the status bar and drawer — not the whole browser window.
+@MainActor
+final class TransferCenter: ObservableObject {
+    @Published var active: TransferProgress?
+    @Published var batches: [TransferBatch] = []
+    @Published private(set) var flightTrigger = 0
+    @Published private(set) var flightIsUpload = false
+
+    var queuedCount: Int { max(0, batches.count - 1) }
+    var hasAny: Bool { active != nil || !batches.isEmpty }
+
+    func pulseFlight(isUpload: Bool) {
+        flightIsUpload = isUpload
+        flightTrigger &+= 1
+    }
+}
+
 @MainActor
 final class BrowserViewModel: ObservableObject {
     private static let noisyLogcatTags: Set<String> = ["trusty", "gsp_crypto_proxy_srv"]
@@ -122,10 +142,15 @@ final class BrowserViewModel: ObservableObject {
     private var sortedEntries: [RemoteFile] = []
     private var lastListingFailed = false
     private var listingCache: [String: [RemoteFile]] = [:]
-    @Published var filterText = ""
+    @Published var filterText = "" {
+        didSet { updateVisibleEntries() }
+    }
     @Published var filterFocusRequest = 0
     @Published var showHidden = UserDefaults.standard.bool(forKey: "showHidden") {
-        didSet { UserDefaults.standard.set(showHidden, forKey: "showHidden") }
+        didSet {
+            UserDefaults.standard.set(showHidden, forKey: "showHidden")
+            updateVisibleEntries()
+        }
     }
     @Published var foldersFirst = (UserDefaults.standard.object(forKey: "foldersFirst") as? Bool) ?? true {
         didSet {
@@ -152,8 +177,6 @@ final class BrowserViewModel: ObservableObject {
     @Published var quickLookItems: [URL] = []
     @Published var usageTree: UsageNode?
     @Published var isMeasuring = false
-    @Published private(set) var flightTrigger = 0
-    @Published private(set) var flightIsUpload = false
     @Published var infoFile: RemoteFile?
     private var usageCache: [String: UsageNode] = [:]
 
@@ -170,22 +193,30 @@ final class BrowserViewModel: ObservableObject {
     @Published var isApkManagerVisible = false
     @Published var isHelpVisible = false
     @Published var diagnostics = ConnectionDiagnostics()
-    @Published var logcatLines: [LogcatLine] = []
-    @Published var logcatFilter = ""
-    @Published var logcatLevel = "All"
+    private var logcatLines: [LogcatLine] = []
+    @Published private(set) var filteredLogcatLines: [LogcatLine] = []
+    @Published var logcatFilter = "" {
+        didSet { refilterLogcat() }
+    }
+    @Published var logcatLevel = "All" {
+        didSet { refilterLogcat() }
+    }
     @Published var quietLogcat = (UserDefaults.standard.object(forKey: "quietLogcat") as? Bool) ?? true {
-        didSet { UserDefaults.standard.set(quietLogcat, forKey: "quietLogcat") }
+        didSet {
+            UserDefaults.standard.set(quietLogcat, forKey: "quietLogcat")
+            refilterLogcat()
+        }
     }
     @Published var isLogcatRunning = false
     @Published var packages: [AndroidPackage] = []
     @Published var packageFilter = ""
     @Published var packageScopeThirdPartyOnly = true
     @Published var isLoadingPackages = false
+    @Published var aapt2Missing = false
     @Published var isTransferDrawerVisible = false
 
-    // Transfer queue
-    @Published var activeTransfer: TransferProgress?
-    @Published private(set) var transferBatches: [TransferBatch] = []
+    // Transfer queue — fast-changing progress lives in its own observable.
+    let transfers = TransferCenter()
     private var batchWorker: Task<Void, Never>?
 
     // Internal clipboard for device-side copy/move
@@ -212,8 +243,6 @@ final class BrowserViewModel: ObservableObject {
     var canPaste: Bool { !clipboardPaths.isEmpty }
     var useSu: Bool { rootMode == .su }
     var suAvailable: Bool { rootMode == .su || rootMode == .adbdRoot }
-    var queuedTransferCount: Int { max(0, transferBatches.count - 1) }
-    var hasTransfers: Bool { activeTransfer != nil || !transferBatches.isEmpty }
 
     /// True when browsing paths a plain adb shell couldn't reach —
     /// the UI shows an amber keyline as a "you are superuser here" signal.
@@ -238,26 +267,35 @@ final class BrowserViewModel: ObservableObject {
             list = list.filter(\.isDirectory) + list.filter { !$0.isDirectory }
         }
         sortedEntries = list
+        updateVisibleEntries()
     }
 
-    var visibleEntries: [RemoteFile] {
+    /// Cached — the table, status bar, and filter bar all read this on every
+    /// render, so recomputing the filter per access made selection feel laggy
+    /// in big folders. Refreshed whenever entries/sort/filter/hidden change.
+    private(set) var visibleEntries: [RemoteFile] = []
+
+    private func updateVisibleEntries() {
         var list = sortedEntries
         if !showHidden { list = list.filter { !$0.name.hasPrefix(".") } }
         if !filterText.isEmpty {
             list = list.filter { $0.name.localizedCaseInsensitiveContains(filterText) }
         }
-        return list
+        visibleEntries = list
     }
 
     var canBookmarkCurrentPath: Bool { !bookmarks.contains(where: { $0.path == currentPath }) }
 
-    var filteredLogcatLines: [LogcatLine] {
-        logcatLines.filter { line in
-            let levelMatches = logcatLevel == "All" || line.level == logcatLevel
-            let textMatches = logcatFilter.isEmpty || line.text.localizedCaseInsensitiveContains(logcatFilter)
-            let quietMatches = !quietLogcat || !Self.noisyLogcatTags.contains(line.tag)
-            return levelMatches && textMatches && quietMatches
-        }
+    private func logcatLineMatches(_ line: LogcatLine) -> Bool {
+        let levelMatches = logcatLevel == "All" || line.level == logcatLevel
+        let textMatches = logcatFilter.isEmpty || line.text.localizedCaseInsensitiveContains(logcatFilter)
+        let quietMatches = !quietLogcat || !Self.noisyLogcatTags.contains(line.tag)
+        return levelMatches && textMatches && quietMatches
+    }
+
+    /// Full recompute — only when a filter control changes, never per line.
+    private func refilterLogcat() {
+        filteredLogcatLines = logcatLines.filter(logcatLineMatches)
     }
 
     var filteredPackages: [AndroidPackage] {
@@ -313,6 +351,12 @@ final class BrowserViewModel: ObservableObject {
         // race to bind port 5037 on a cold start and all fail.
         Task {
             await client.startServer()
+            // If a server was already running (Android Studio, a terminal) it
+            // is on the broken openscreen mDNS backend: pairing faults and
+            // wireless devices are never rediscovered after a port change,
+            // which forced users back into the pairing wizard. Restart it
+            // once with the Bonjour backend before anything wireless runs.
+            await ensureWirelessReady()
             startDeviceTracking(client: client)
             startReconnectLoop(client: client)
             refreshDevices()
@@ -327,9 +371,11 @@ final class BrowserViewModel: ObservableObject {
         Task {
             let apply = { (found: [DeviceInfo]) in
                 self.devices = found
-                // Remember any ip:port endpoint (even offline) so the
-                // reconnect loop can revive it after a drop.
-                for d in found where d.serial.contains(":") {
+                // Remember usable ip:port endpoints so the reconnect loop can
+                // revive them after a drop. Only usable ones: a lingering
+                // offline entry carries a dead port that would evict the
+                // freshly-working endpoint for the same host.
+                for d in found where d.serial.contains(":") && d.isUsable {
                     self.rememberWireless(d.serial)
                 }
                 if let current = self.selectedSerial, !found.contains(where: { $0.serial == current && $0.isUsable }) {
@@ -356,9 +402,18 @@ final class BrowserViewModel: ObservableObject {
     private var reconnectTask: Task<Void, Never>?
 
     private func rememberWireless(_ endpoint: String) {
-        guard endpoint.contains(":"), !knownWirelessEndpoints.contains(endpoint) else { return }
-        knownWirelessEndpoints.append(endpoint)
-        if knownWirelessEndpoints.count > 8 { knownWirelessEndpoints.removeFirst() }
+        guard endpoint.contains(":") else { return }
+        // One endpoint per host: Android rotates the wireless-debugging port
+        // on every reboot/toggle, so keeping old ports for the same phone just
+        // makes every reconnect pass slower (each dead port costs a timeout).
+        let host = endpoint.split(separator: ":").first.map(String.init) ?? endpoint
+        var updated = knownWirelessEndpoints.filter {
+            $0.split(separator: ":").first.map(String.init) != host
+        }
+        updated.append(endpoint)
+        if updated.count > 8 { updated.removeFirst(updated.count - 8) }
+        guard updated != knownWirelessEndpoints else { return }
+        knownWirelessEndpoints = updated
         UserDefaults.standard.set(knownWirelessEndpoints, forKey: "wirelessEndpoints")
     }
 
@@ -388,27 +443,40 @@ final class BrowserViewModel: ObservableObject {
     /// the wireless debugging port after the app was quit.
     @discardableResult
     private func reconnectWirelessDevices(client: AdbClient) async -> Bool {
-        // Work off fresh data so we never disturb a healthy connection.
+        // Work off fresh data so we never disturb a healthy connection. Leave
+        // alone anything that isn't outright offline — a device in
+        // "connecting"/"authorizing" is mid-TLS-handshake, and disconnecting
+        // it every pass would keep killing a connection about to succeed.
         let current = (try? await client.listDevices()) ?? []
-        let online = Set(current.filter { $0.isUsable }.map(\.serial))
+        let settled = Set(current.filter { $0.state != "offline" }.map(\.serial))
 
         var targets = Set(knownWirelessEndpoints)
         for svc in await client.mdnsServices() where svc.isConnect {
             targets.insert(svc.endpoint)
         }
 
-        let missing = targets.subtracting(online)
+        let missing = targets.subtracting(settled)
         guard !missing.isEmpty else { return false }
 
-        var revived = false
-        for ep in missing {
-            await client.disconnect(endpoint: ep)   // clear stale/offline state
-            if (try? await client.connect(endpoint: ep, timeout: 6)) != nil {
-                revived = true
-                rememberWireless(ep)
+        // Attempt every endpoint concurrently: with several stale ports a
+        // serial pass took up to 6 s × N and stalled startup reconnects.
+        let revived = await withTaskGroup(of: String?.self) { group in
+            for ep in missing {
+                group.addTask {
+                    await client.disconnect(endpoint: ep)   // clear stale/offline state
+                    return (try? await client.connect(endpoint: ep, timeout: 6)) != nil ? ep : nil
+                }
             }
+            var connected: [String] = []
+            for await ep in group where ep != nil {
+                connected.append(ep!)
+            }
+            return connected
         }
-        return revived
+        for ep in revived {
+            rememberWireless(ep)
+        }
+        return !revived.isEmpty
     }
 
     /// adb track-devices: refresh the device list the moment something
@@ -475,13 +543,17 @@ final class BrowserViewModel: ObservableObject {
         return await client.mdnsServices()
     }
 
-    /// One-time clean server restart so wireless discovery uses the Bonjour
-    /// mDNS backend (the openscreen default is broken for pairing on macOS).
+    /// One-time server check: if the running server is on the openscreen mDNS
+    /// backend (broken for pairing and discovery on macOS), restart it with
+    /// the Bonjour backend. A server we started ourselves already has the
+    /// right environment, so this usually does nothing.
     private var wirelessServerReady = false
     func ensureWirelessReady() async {
         guard !wirelessServerReady, let client else { return }
         wirelessServerReady = true
-        await client.restartServer()
+        if await client.serverUsesOpenscreen() {
+            await client.restartServer()
+        }
     }
 
     func makeQrPairing() -> QrPairing {
@@ -806,32 +878,68 @@ final class BrowserViewModel: ObservableObject {
         refreshDiagnostics()
     }
 
+    private var logcatPending: [LogcatLine] = []
+    private var logcatFlushScheduled = false
+
     func startLogcat() {
         guard let client, let serial = selectedSerial else { return }
         logcatTask?.cancel()
         logcatLines = []
+        logcatPending = []
+        filteredLogcatLines = []
         isLogcatRunning = true
         logcatTask = Task { [weak self] in
             for await line in client.logcat(serial: serial) {
                 guard let self, !Task.isCancelled else { return }
-                self.logcatLines.append(LogcatLine(text: line))
-                if self.logcatLines.count > 3000 {
-                    self.logcatLines.removeFirst(self.logcatLines.count - 3000)
-                }
+                // Buffer and flush on a timer: publishing per line made the
+                // viewer re-filter and re-diff thousands of rows per line,
+                // pegging a core on busy streams.
+                self.logcatPending.append(LogcatLine(text: line))
+                self.scheduleLogcatFlush()
             }
+            self?.flushLogcat()
             self?.isLogcatRunning = false
+        }
+    }
+
+    private func scheduleLogcatFlush() {
+        guard !logcatFlushScheduled else { return }
+        logcatFlushScheduled = true
+        Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(120))
+            guard let self else { return }
+            self.logcatFlushScheduled = false
+            self.flushLogcat()
+        }
+    }
+
+    private func flushLogcat() {
+        guard !logcatPending.isEmpty else { return }
+        let fresh = logcatPending
+        logcatPending.removeAll(keepingCapacity: true)
+        logcatLines.append(contentsOf: fresh)
+        if logcatLines.count > 3000 {
+            logcatLines.removeFirst(logcatLines.count - 3000)
+        }
+        // Incremental: only the new lines are filtered, not the whole buffer.
+        filteredLogcatLines.append(contentsOf: fresh.filter(logcatLineMatches))
+        if filteredLogcatLines.count > 3000 {
+            filteredLogcatLines.removeFirst(filteredLogcatLines.count - 3000)
         }
     }
 
     func stopLogcat() {
         logcatTask?.cancel()
         logcatTask = nil
+        flushLogcat()
         isLogcatRunning = false
     }
 
     func clearLogcat() {
         guard let client, let serial = selectedSerial else { return }
         logcatLines = []
+        logcatPending = []
+        filteredLogcatLines = []
         Task { await client.clearLogcat(serial: serial) }
     }
 
@@ -839,6 +947,7 @@ final class BrowserViewModel: ObservableObject {
         guard let client, let serial = selectedSerial else { return }
         packageMetadataTask?.cancel()
         isLoadingPackages = true
+        aapt2Missing = AdbClient.aapt2Path == nil
         Task {
             do {
                 packages = try await client.listPackages(serial: serial, thirdPartyOnly: packageScopeThirdPartyOnly)
@@ -856,12 +965,23 @@ final class BrowserViewModel: ObservableObject {
         packageMetadataTask = Task { [weak self] in
             guard let self else { return }
             let snapshot = self.packages
-            for package in snapshot {
-                guard !Task.isCancelled else { return }
-                let enriched = await client.enrichPackage(package, serial: serial)
-                guard !Task.isCancelled else { return }
-                if let index = self.packages.firstIndex(where: { $0.id == enriched.id }) {
-                    self.packages[index] = enriched
+            // A few packages at a time — serial enrichment made icons trickle
+            // in for minutes on large lists; more would crowd the adb link.
+            let limiter = ConcurrencyLimiter(slots: 4)
+            await withTaskGroup(of: AndroidPackage?.self) { group in
+                for package in snapshot {
+                    group.addTask {
+                        guard await limiter.acquire() else { return nil }
+                        let enriched = await client.enrichPackage(package, serial: serial)
+                        await limiter.release()
+                        return enriched
+                    }
+                }
+                for await enriched in group {
+                    guard let enriched, !Task.isCancelled else { continue }
+                    if let index = self.packages.firstIndex(where: { $0.id == enriched.id }) {
+                        self.packages[index] = enriched
+                    }
                 }
             }
         }
@@ -984,7 +1104,9 @@ final class BrowserViewModel: ObservableObject {
         let dest = currentPath
         let existing = Set(entries.map(\.name))
         let conflicts = sources.map { ($0 as NSString).lastPathComponent }.filter { existing.contains($0) }
-        if isCut { clipboardPaths = [] }
+        // The cut clipboard is cleared per-item in performPaste once each move
+        // succeeds — clearing here lost the selection when a move failed or
+        // the conflict dialog was cancelled.
 
         let proceed: (ConflictResolution?) -> Void = { resolution in
             Task { await self.performPaste(sources: sources, isCut: isCut, dest: dest,
@@ -1005,6 +1127,7 @@ final class BrowserViewModel: ObservableObject {
                               existing: Set<String>, resolution: ConflictResolution?) async {
         guard let client, let serial = selectedSerial else { return }
         var taken = existing
+        var moved: Set<String> = []
         await withStatus("\(isCut ? "Moving" : "Copying") \(sources.count) item(s)…") {
             for src in sources {
                 let name = (src as NSString).lastPathComponent
@@ -1012,7 +1135,7 @@ final class BrowserViewModel: ObservableObject {
                 if existing.contains(name) {
                     switch resolution {
                     case .skip, nil:
-                        continue
+                        continue   // skipped items stay on the clipboard
                     case .replace:
                         try await client.delete(path: self.join(dest, name), serial: serial, su: self.useSu)
                     case .keepBoth:
@@ -1023,10 +1146,16 @@ final class BrowserViewModel: ObservableObject {
                 let target = self.join(dest, targetName)
                 if isCut {
                     try await client.move(from: src, to: target, serial: serial, su: self.useSu)
+                    moved.insert(src)
                 } else {
                     try await client.copy(from: src, to: target, serial: serial, su: self.useSu)
                 }
             }
+        }
+        if isCut, !moved.isEmpty {
+            // Drop only what actually moved; a failed item can be retried.
+            clipboardPaths.removeAll { moved.contains($0) }
+            if clipboardPaths.isEmpty { clipboardIsCut = false }
         }
         invalidateListing(dest)
         await loadCurrentPath()
@@ -1149,6 +1278,20 @@ final class BrowserViewModel: ObservableObject {
         if !apks.isEmpty { apkPrompt = apks }
     }
 
+    /// "Install APK…" button in the APK manager: pick .apk files in Finder.
+    func installApkViaPanel() {
+        guard selectedSerial != nil else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = true
+        panel.allowedContentTypes = [UTType(filenameExtension: "apk") ?? .data]
+        panel.prompt = "Install"
+        panel.message = "Choose APK files to install on the device"
+        guard panel.runModal() == .OK, !panel.urls.isEmpty else { return }
+        installApks(panel.urls)
+    }
+
     func installApks(_ urls: [URL]) {
         guard let client, let serial = selectedSerial else { return }
         Task {
@@ -1168,6 +1311,9 @@ final class BrowserViewModel: ObservableObject {
             }
             if failures.isEmpty {
                 statusMessage = "Installed \(urls.count == 1 ? urls[0].lastPathComponent : "\(urls.count) APKs")"
+            }
+            if failures.count < urls.count, isApkManagerVisible {
+                loadPackages()   // show the newly installed app in the list
             }
         }
     }
@@ -1257,9 +1403,8 @@ final class BrowserViewModel: ObservableObject {
     // MARK: queue machinery
 
     private func enqueue(_ batch: TransferBatch) {
-        transferBatches.append(batch)
-        flightIsUpload = batch.isUpload
-        flightTrigger &+= 1
+        transfers.batches.append(batch)
+        transfers.pulseFlight(isUpload: batch.isUpload)
         pumpTransfers()
     }
 
@@ -1268,11 +1413,11 @@ final class BrowserViewModel: ObservableObject {
     }
 
     private func pumpTransfers() {
-        guard batchWorker == nil, let batch = transferBatches.first else { return }
+        guard batchWorker == nil, let batch = transfers.batches.first else { return }
         batchWorker = Task {
             await self.run(batch: batch)
-            self.transferBatches.removeAll { $0.id == batch.id }
-            self.activeTransfer = nil
+            self.transfers.batches.removeAll { $0.id == batch.id }
+            self.transfers.active = nil
             self.batchWorker = nil
             self.pumpTransfers()
         }
@@ -1366,7 +1511,7 @@ final class BrowserViewModel: ObservableObject {
                 lastSize = size
                 lastDate = now
                 let fraction = expected.flatMap { $0 > 0 ? min(1, Double(size) / Double($0)) : nil }
-                self?.activeTransfer = TransferProgress(
+                self?.transfers.active = TransferProgress(
                     name: file.name, isUpload: false, fraction: fraction, speed: speed, counter: counter
                 )
                 try? await Task.sleep(for: .milliseconds(400))
@@ -1398,7 +1543,7 @@ final class BrowserViewModel: ObservableObject {
                 lastSize = size
                 lastDate = now
                 let fraction = expected.flatMap { $0 > 0 ? min(1, Double(size) / Double($0)) : nil }
-                self?.activeTransfer = TransferProgress(
+                self?.transfers.active = TransferProgress(
                     name: name, isUpload: true, fraction: fraction, speed: speed, counter: counter
                 )
                 try? await Task.sleep(for: .milliseconds(900))

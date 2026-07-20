@@ -77,6 +77,7 @@ struct HelpView: View {
 
 struct TransferDrawerView: View {
     @ObservedObject var model: BrowserViewModel
+    @ObservedObject var transfers: TransferCenter
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -85,7 +86,7 @@ struct TransferDrawerView: View {
                 Label("Transfers", systemImage: "tray.full")
                     .font(.title3.weight(.semibold))
                 Spacer()
-                if model.activeTransfer != nil {
+                if transfers.active != nil {
                     Button("Cancel Current") { model.cancelCurrentTransfer() }
                 }
                 Button("Done") { dismiss() }
@@ -94,7 +95,7 @@ struct TransferDrawerView: View {
             .padding(14)
             .background(.bar)
 
-            if !model.hasTransfers {
+            if !transfers.hasAny {
                 ContentUnavailableView {
                     Label("No Transfers", systemImage: "tray")
                 } description: {
@@ -103,7 +104,7 @@ struct TransferDrawerView: View {
                 .frame(width: 620, height: 360)
             } else {
                 List {
-                    if let transfer = model.activeTransfer {
+                    if let transfer = transfers.active {
                         Section("Active") {
                             HStack(spacing: 10) {
                                 Image(systemName: transfer.isUpload ? "arrow.up.circle.fill" : "arrow.down.circle.fill")
@@ -130,7 +131,7 @@ struct TransferDrawerView: View {
                             .padding(.vertical, 4)
                         }
                     }
-                    let queued = model.transferBatches.dropFirst(model.activeTransfer == nil ? 0 : 1)
+                    let queued = transfers.batches.dropFirst(transfers.active == nil ? 0 : 1)
                     if !queued.isEmpty {
                         Section("Queued") {
                             ForEach(Array(queued)) { batch in
@@ -340,6 +341,10 @@ struct ApkManagerView: View {
                 Label("APK Manager", systemImage: "shippingbox")
                     .font(.title3.weight(.semibold))
                 Spacer()
+                Button { model.installApkViaPanel() } label: {
+                    Label("Install APK…", systemImage: "plus")
+                }
+                .help("Install an APK from your Mac")
                 Button { model.loadPackages() } label: {
                     Image(systemName: "arrow.clockwise")
                 }
@@ -365,6 +370,16 @@ struct ApkManagerView: View {
                     .foregroundStyle(.secondary)
             }
             .padding(12)
+
+            if model.aapt2Missing {
+                Label("App names and icons need aapt2 from the Android build-tools (install via Android Studio or `sdkmanager \"build-tools;35.0.0\"`).",
+                      systemImage: "info.circle")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 8)
+            }
 
             Divider()
 

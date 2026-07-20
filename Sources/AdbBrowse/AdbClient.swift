@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 struct ShellResult {
@@ -266,11 +267,16 @@ final class AdbClient: Sendable {
     /// Run a shell command on the device via a persistent `adb shell`
     /// (root shell when `su`), falling back to a one-shot invocation if the
     /// persistent shell hiccups (device reconnect, su death, …).
-    func shell(_ command: String, serial: String, su: Bool, timeout: TimeInterval = 25) async throws -> ShellResult {
-        let persistent = await shellPool.shell(adbPath: adbPath, serial: serial, su: su)
+    /// Slow commands must pass `lane: .bulk` so they never block navigation.
+    func shell(_ command: String, serial: String, su: Bool, timeout: TimeInterval = 25,
+               lane: ShellLane = .interactive) async throws -> ShellResult {
+        let persistent = await shellPool.shell(adbPath: adbPath, serial: serial, su: su, lane: lane)
         do {
             return try await persistent.run(command, timeout: timeout)
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
+            try Task.checkCancellation()
             return try await oneShotShell(command, serial: serial, su: su, timeout: timeout)
         }
     }
@@ -328,7 +334,7 @@ final class AdbClient: Sendable {
     func fetchStatus(serial: String) async -> DeviceStatus {
         var status = DeviceStatus()
 
-        if let r = try? await shell("dumpsys battery", serial: serial, su: false, timeout: 15), r.ok {
+        if let r = try? await shell("dumpsys battery", serial: serial, su: false, timeout: 15, lane: .bulk), r.ok {
             for line in r.stdout.split(separator: "\n") {
                 let t = line.trimmingCharacters(in: .whitespaces)
                 if t.hasPrefix("level:"), let v = Int(t.dropFirst(6).trimmingCharacters(in: .whitespaces)) {
@@ -340,7 +346,7 @@ final class AdbClient: Sendable {
             }
         }
 
-        if let r = try? await shell("df /data", serial: serial, su: false, timeout: 15), r.ok,
+        if let r = try? await shell("df /data", serial: serial, su: false, timeout: 15, lane: .bulk), r.ok,
            let last = r.stdout.split(separator: "\n").last {
             let tok = last.split(separator: " ", omittingEmptySubsequences: true)
             if tok.count >= 4, let totalKB = Int64(tok[1]), let availKB = Int64(tok[3]) {
@@ -350,7 +356,7 @@ final class AdbClient: Sendable {
         }
 
         if let r = try? await shell("settings get secure theme_customization_overlay_packages",
-                                    serial: serial, su: false, timeout: 15), r.ok,
+                                    serial: serial, su: false, timeout: 15, lane: .bulk), r.ok,
            let data = r.stdout.trimmingCharacters(in: .whitespacesAndNewlines).data(using: .utf8),
            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             status.seedHex = (obj["android.theme.customization.system_palette"] as? String)
@@ -386,7 +392,7 @@ final class AdbClient: Sendable {
     /// Recursive case-insensitive filename search, capped at 80 results.
     func find(query: String, under root: String, serial: String, su: Bool) async -> [String] {
         let cmd = "find \(Self.quote(root)) -iname \(Self.quote("*\(query)*")) 2>/dev/null | head -80"
-        guard let r = try? await shell(cmd, serial: serial, su: su, timeout: 60) else { return [] }
+        guard let r = try? await shell(cmd, serial: serial, su: su, timeout: 60, lane: .bulk) else { return [] }
         return r.stdout
             .split(separator: "\n")
             .map { String($0).trimmingCharacters(in: .init(charactersIn: "\r")) }
@@ -400,7 +406,7 @@ final class AdbClient: Sendable {
         // Trailing slash so du follows symlinked roots like /sdcard.
         let target = path.hasSuffix("/") ? path : path + "/"
         let cmd = "du -a -k -d \(depth) \(Self.quote(target)) 2>/dev/null"
-        let result = try await shell(cmd, serial: serial, su: su, timeout: 180)
+        let result = try await shell(cmd, serial: serial, su: su, timeout: 180, lane: .bulk)
 
         var entries: [(String, Int64)] = []
         for line in result.stdout.split(separator: "\n") {
@@ -420,7 +426,7 @@ final class AdbClient: Sendable {
 
     /// Current byte size of a remote file (used for push progress).
     func statSize(path: String, serial: String, su: Bool) async -> Int64? {
-        guard let r = try? await shell("stat -c %s \(Self.quote(path))", serial: serial, su: su, timeout: 10),
+        guard let r = try? await shell("stat -c %s \(Self.quote(path))", serial: serial, su: su, timeout: 10, lane: .bulk),
               r.ok else { return nil }
         return Int64(r.stdout.trimmingCharacters(in: .whitespacesAndNewlines))
     }
@@ -453,23 +459,34 @@ final class AdbClient: Sendable {
     }
 
     func delete(path: String, serial: String, su: Bool) async throws {
-        try await runOrThrow("rm -rf \(Self.quote(path))", serial: serial, su: su, timeout: 300)
+        try await runOrThrow("rm -rf \(Self.quote(path))", serial: serial, su: su, timeout: 300, lane: .bulk)
     }
 
     func move(from: String, to: String, serial: String, su: Bool) async throws {
-        try await runOrThrow("mv \(Self.quote(from)) \(Self.quote(to))", serial: serial, su: su, timeout: 600)
+        try await runOrThrow("mv \(Self.quote(from)) \(Self.quote(to))", serial: serial, su: su, timeout: 600, lane: .bulk)
     }
 
     func copy(from: String, to: String, serial: String, su: Bool) async throws {
-        try await runOrThrow("cp -a \(Self.quote(from)) \(Self.quote(to))", serial: serial, su: su, timeout: 3600)
+        try await runOrThrow("cp -a \(Self.quote(from)) \(Self.quote(to))", serial: serial, su: su, timeout: 3600, lane: .bulk)
     }
 
-    private func runOrThrow(_ command: String, serial: String, su: Bool, timeout: TimeInterval = 60) async throws {
-        let r = try await shell(command, serial: serial, su: su, timeout: timeout)
+    private func runOrThrow(_ command: String, serial: String, su: Bool, timeout: TimeInterval = 60,
+                            lane: ShellLane = .interactive) async throws {
+        let r = try await shell(command, serial: serial, su: su, timeout: timeout, lane: lane)
         guard r.ok else { throw AdbError(message: r.combinedError.isEmpty ? "Command failed: \(command)" : r.combinedError) }
     }
 
     // MARK: wireless pairing / connection
+
+    /// True when the running adb server is using the broken openscreen mDNS
+    /// backend — i.e. it was started by something else (Android Studio, a
+    /// terminal) without `serverEnvironment`. On that backend `adb pair`
+    /// faults and `adb mdns services` comes back empty, so wireless devices
+    /// are never rediscovered after Android rotates the debugging port.
+    func serverUsesOpenscreen() async -> Bool {
+        guard let r = try? await run(["mdns", "check"], timeout: 8) else { return false }
+        return r.combinedOutput.localizedCaseInsensitiveContains("openscreen")
+    }
 
     /// `adb pair HOST:PORT CODE` — pairs with the phone's "Pair with code" dialog.
     func pair(endpoint: String, code: String) async throws {
@@ -599,11 +616,19 @@ final class AdbClient: Sendable {
             .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 
+    /// Resolved once — walking build-tools directories per package is wasted work.
+    static let aapt2Path: String? = resolveAapt2Path()
+
     func enrichPackage(_ package: AndroidPackage, serial: String) async -> AndroidPackage {
-        guard let aapt2 = Self.resolveAapt2Path() else { return package }
+        guard let aapt2 = Self.aapt2Path else { return package }
+        // Key the cache by install path: Android gives every app update a new
+        // /data/app/~~…/ directory, so an updated app never shows the previous
+        // version's label or icon.
+        let digest = SHA256.hash(data: Data(package.apkPath.utf8))
+            .prefix(6).map { String(format: "%02x", $0) }.joined()
         let workDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("AdbBrowsePackageMetadata", isDirectory: true)
-            .appendingPathComponent(package.name, isDirectory: true)
+            .appendingPathComponent("\(package.name)-\(digest)", isDirectory: true)
         try? FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
 
         let apkURL = workDir.appendingPathComponent("base.apk")
@@ -612,27 +637,118 @@ final class AdbClient: Sendable {
             guard pulled?.ok == true else { return package }
         }
 
-        guard let badging = try? await Self.runLocal(aapt2, ["dump", "badging", apkURL.path], timeout: 15),
-              badging.ok else { return package }
-
         var enriched = package
-        enriched.label = Self.bestApplicationLabel(from: badging.stdout)
+        var declaredIcon: String?
+        if let badging = try? await Self.runLocal(aapt2, ["dump", "badging", apkURL.path], timeout: 15),
+           badging.ok {
+            enriched.label = Self.bestApplicationLabel(from: badging.stdout)
+            declaredIcon = Self.bestIconPath(from: badging.stdout)
+        }
 
-        if let iconInApk = Self.bestIconPath(from: badging.stdout) {
-            let ext = (iconInApk as NSString).pathExtension
-            let iconURL = workDir.appendingPathComponent("icon.\(ext.isEmpty ? "png" : ext)")
-            if !FileManager.default.fileExists(atPath: iconURL.path),
-               let iconData = try? await Self.runLocalRaw("/usr/bin/unzip", ["-p", apkURL.path, iconInApk], timeout: 10),
-               iconData.exitCode == 0,
-               !iconData.stdout.isEmpty {
-                try? iconData.stdout.write(to: iconURL)
+        if let iconURL = await extractIcon(for: package, declaredIcon: declaredIcon,
+                                           baseURL: apkURL, workDir: workDir, serial: serial) {
+            enriched.iconPath = iconURL.path
+        }
+        return enriched
+    }
+
+    /// Find a raster launcher icon for the package. The badging-declared
+    /// bitmap in base.apk is tried first, but Play-installed apps usually
+    /// declare adaptive (XML) icons and keep the rasters in a
+    /// `split_config.<density>.apk` resource split — so fall back to pulling
+    /// density splits and scanning every available APK for the best
+    /// launcher-looking bitmap.
+    private func extractIcon(for package: AndroidPackage, declaredIcon: String?,
+                             baseURL: URL, workDir: URL, serial: String) async -> URL? {
+        if let cached = try? FileManager.default.contentsOfDirectory(at: workDir, includingPropertiesForKeys: nil)
+            .first(where: { $0.lastPathComponent.hasPrefix("icon.") }) {
+            // "icon.none" caches a failed search so refreshes don't redo it.
+            return cached.lastPathComponent == "icon.none" ? nil : cached
+        }
+
+        var apks = [baseURL]
+        if let declaredIcon, let url = await extractEntry(declaredIcon, from: baseURL, workDir: workDir) {
+            return url
+        }
+
+        // Density splits are small and hold the raster resources.
+        for splitPath in await splitApkPaths(package: package.name, serial: serial) {
+            let splitName = (splitPath as NSString).lastPathComponent
+            guard splitName != "base.apk", splitName.localizedCaseInsensitiveContains("dpi") else { continue }
+            let local = workDir.appendingPathComponent(splitName)
+            if !FileManager.default.fileExists(atPath: local.path) {
+                guard (try? await run(["-s", serial, "pull", splitPath, local.path], timeout: 45))?.ok == true else { continue }
             }
-            if FileManager.default.fileExists(atPath: iconURL.path) {
-                enriched.iconPath = iconURL.path
+            apks.append(local)
+            if let declaredIcon, let url = await extractEntry(declaredIcon, from: local, workDir: workDir) {
+                return url
             }
         }
 
-        return enriched
+        // Last resort: the best-scoring, largest launcher bitmap in any APK.
+        var best: (score: Int, size: Int, apk: URL, entry: String)?
+        for apk in apks {
+            for entry in await Self.zipEntries(in: apk) {
+                let score = Self.iconCandidateScore(entry.name)
+                guard score > 0 else { continue }
+                if best == nil || (score, entry.size) > (best!.score, best!.size) {
+                    best = (score, entry.size, apk, entry.name)
+                }
+            }
+        }
+        if let best, let url = await extractEntry(best.entry, from: best.apk, workDir: workDir) {
+            return url
+        }
+        FileManager.default.createFile(atPath: workDir.appendingPathComponent("icon.none").path, contents: nil)
+        return nil
+    }
+
+    /// All APKs of an installed package (base + splits) via `pm path`.
+    private func splitApkPaths(package: String, serial: String) async -> [String] {
+        guard let r = try? await oneShotShell("pm path \(Self.quote(package))", serial: serial, su: false, timeout: 15),
+              r.ok else { return [] }
+        return r.stdout.split(separator: "\n").compactMap { line in
+            let text = String(line).trimmingCharacters(in: .whitespacesAndNewlines)
+            return text.hasPrefix("package:") ? String(text.dropFirst("package:".count)) : nil
+        }
+    }
+
+    /// Unzip a single member to `workDir/icon.<ext>`; nil unless it's a raster.
+    private func extractEntry(_ entry: String, from apk: URL, workDir: URL) async -> URL? {
+        let ext = (entry as NSString).pathExtension.lowercased()
+        guard ["png", "webp", "jpg", "jpeg"].contains(ext) else { return nil }
+        guard let data = try? await Self.runLocalRaw("/usr/bin/unzip", ["-p", apk.path, entry], timeout: 10),
+              data.exitCode == 0, !data.stdout.isEmpty else { return nil }
+        let dest = workDir.appendingPathComponent("icon.\(ext)")
+        try? data.stdout.write(to: dest)
+        return FileManager.default.fileExists(atPath: dest.path) ? dest : nil
+    }
+
+    /// `unzip -l` listing as (member name, uncompressed size).
+    private static func zipEntries(in apk: URL) async -> [(name: String, size: Int)] {
+        guard let r = try? await runLocal("/usr/bin/unzip", ["-l", apk.path], timeout: 10), r.ok else { return [] }
+        var entries: [(String, Int)] = []
+        for line in r.stdout.split(separator: "\n") {
+            let tokens = line.split(separator: " ", omittingEmptySubsequences: true)
+            guard tokens.count >= 4, let size = Int(tokens[0]), size > 0 else { continue }
+            entries.append((tokens[3...].joined(separator: " "), size))
+        }
+        return entries
+    }
+
+    /// Rank zip members as launcher-icon candidates. Plain ic_launcher beats
+    /// the round variant, which beats adaptive foreground layers and generic
+    /// mipmap rasters; 0 means not a candidate.
+    private static func iconCandidateScore(_ name: String) -> Int {
+        let lower = name.lowercased()
+        guard lower.hasPrefix("res/"),
+              lower.hasSuffix(".png") || lower.hasSuffix(".webp") else { return 0 }
+        if lower.contains("ic_launcher") {
+            if lower.contains("background") || lower.contains("monochrome") { return 0 }
+            if lower.contains("foreground") { return 1 }
+            return lower.contains("round") ? 2 : 3
+        }
+        return lower.contains("mipmap") ? 1 : 0
     }
 
     private static func badgingValue(prefix: String, in text: String) -> String? {
@@ -740,7 +856,7 @@ final class AdbClient: Sendable {
     /// Total size of a file or folder tree (`du -sk`).
     func sizeOf(path: String, serial: String, su: Bool) async -> Int64? {
         let target = path.hasSuffix("/") ? path : path + "/"
-        guard let r = try? await shell("du -sk \(Self.quote(target))", serial: serial, su: su, timeout: 300),
+        guard let r = try? await shell("du -sk \(Self.quote(target))", serial: serial, su: su, timeout: 300, lane: .bulk),
               let kb = Int64(r.stdout.split(separator: "\t").first?
                   .trimmingCharacters(in: .whitespaces) ?? "") else { return nil }
         return kb * 1024
@@ -797,16 +913,20 @@ final class AdbClient: Sendable {
 
         let stage = "/data/local/tmp/.adbbrowse-\(UUID().uuidString.prefix(8))"
         let q = Self.quote
+        // Stage under the remote file's own basename — `cp -a` preserves it,
+        // and callers may pass a different local `fileName` (e.g. "App.apk"
+        // for a remote base.apk).
+        let stagedName = (remotePath as NSString).lastPathComponent
         do {
             try await runOrThrow("mkdir -p \(q(stage)) && cp -a \(q(remotePath)) \(q(stage + "/")) && chmod -R a+rX \(q(stage))",
-                                 serial: serial, su: true, timeout: 3600)
-            let staged = try await run(["-s", serial, "pull", stage + "/" + fileName, target], timeout: 3600)
+                                 serial: serial, su: true, timeout: 3600, lane: .bulk)
+            let staged = try await run(["-s", serial, "pull", stage + "/" + stagedName, target], timeout: 3600)
             guard staged.ok else { throw AdbError(message: "Pull failed: \(staged.combinedError)") }
         } catch {
-            _ = try? await shell("rm -rf \(q(stage))", serial: serial, su: true)
+            _ = try? await shell("rm -rf \(q(stage))", serial: serial, su: true, lane: .bulk)
             throw error
         }
-        _ = try? await shell("rm -rf \(q(stage))", serial: serial, su: true)
+        _ = try? await shell("rm -rf \(q(stage))", serial: serial, su: true, lane: .bulk)
     }
 
     /// Push a local file/folder to `remoteDir/destName`. If adbd can't write
@@ -828,9 +948,9 @@ final class AdbClient: Sendable {
         do {
             let staged = try await run(["-s", serial, "push", localURL.path, stage], timeout: 3600)
             guard staged.ok else { throw AdbError(message: "Push failed: \(staged.combinedError)") }
-            try await runOrThrow("mv \(q(stage)) \(q(dest))", serial: serial, su: true, timeout: 600)
+            try await runOrThrow("mv \(q(stage)) \(q(dest))", serial: serial, su: true, timeout: 600, lane: .bulk)
         } catch {
-            _ = try? await shell("rm -rf \(q(stage))", serial: serial, su: true)
+            _ = try? await shell("rm -rf \(q(stage))", serial: serial, su: true, lane: .bulk)
             throw error
         }
     }
