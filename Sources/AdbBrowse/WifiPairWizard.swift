@@ -56,9 +56,7 @@ struct WifiPairWizard: View {
 
     private var header: some View {
         HStack(spacing: 12) {
-            Image(systemName: "wifi")
-                .font(.title2)
-                .foregroundStyle(model.accent)
+            TonalIconBadge(icon: "wifi", tint: model.accent, side: 38)
             VStack(alignment: .leading, spacing: 1) {
                 Text("Connect over Wi-Fi").font(.headline)
                 Text(subtitle).font(.caption).foregroundStyle(.secondary)
@@ -66,11 +64,12 @@ struct WifiPairWizard: View {
             Spacer()
             HStack(spacing: 5) {
                 ForEach(Step.allCases, id: \.rawValue) { s in
-                    Circle()
-                        .fill(s.rawValue <= step.rawValue ? model.accent : Color.secondary.opacity(0.25))
-                        .frame(width: 7, height: 7)
+                    Capsule(style: .continuous)
+                        .fill(s.rawValue <= step.rawValue ? model.accent : model.accent.opacity(DS.tonal))
+                        .frame(width: s == step ? 20 : 7, height: 7)
                 }
             }
+            .animation(.spring(response: 0.35, dampingFraction: 0.8), value: step)
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 14)

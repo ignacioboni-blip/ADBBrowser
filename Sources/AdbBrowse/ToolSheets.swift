@@ -5,15 +5,10 @@ struct HelpView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
-                Label("ADB Browser Help", systemImage: "questionmark.circle")
-                    .font(.title3.weight(.semibold))
-                Spacer()
+            SheetHeader(title: "ADB Browser Help", icon: "questionmark.circle", tint: .accentColor) {
                 Button("Done") { dismiss() }
                     .keyboardShortcut(.defaultAction)
             }
-            .padding(14)
-            .background(.bar)
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
@@ -82,25 +77,21 @@ struct TransferDrawerView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
-                Label("Transfers", systemImage: "tray.full")
-                    .font(.title3.weight(.semibold))
-                Spacer()
+            SheetHeader(title: "Transfers", icon: "tray.full", tint: model.accent) {
                 if transfers.active != nil {
                     Button("Cancel Current") { model.cancelCurrentTransfer() }
                 }
                 Button("Done") { dismiss() }
                     .keyboardShortcut(.defaultAction)
             }
-            .padding(14)
-            .background(.bar)
 
             if !transfers.hasAny {
-                ContentUnavailableView {
-                    Label("No Transfers", systemImage: "tray")
-                } description: {
-                    Text("Downloads and uploads will appear here.")
-                }
+                EmptyStateView(
+                    icon: "tray",
+                    title: "No Transfers",
+                    message: "Downloads and uploads will appear here.",
+                    tint: model.accent
+                )
                 .frame(width: 620, height: 360)
             } else {
                 List {
@@ -164,7 +155,7 @@ struct ConnectionDiagnosticsView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            header(title: "Connection Diagnostics", icon: "stethoscope") {
+            SheetHeader(title: "Connection Diagnostics", icon: "stethoscope", tint: model.accent) {
                 Button { model.refreshDiagnostics() } label: {
                     Image(systemName: "arrow.clockwise")
                 }
@@ -208,20 +199,10 @@ struct ConnectionDiagnosticsView: View {
                 .font(.system(.caption, design: .monospaced))
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(10)
-                .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 6))
+                .padding(12)
+                .background(.quaternary.opacity(0.45),
+                            in: RoundedRectangle(cornerRadius: DS.corner, style: .continuous))
         }
-    }
-
-    private func header(title: String, icon: String, @ViewBuilder actions: () -> some View) -> some View {
-        HStack(spacing: 10) {
-            Label(title, systemImage: icon)
-                .font(.title3.weight(.semibold))
-            Spacer()
-            actions()
-        }
-        .padding(14)
-        .background(.bar)
     }
 }
 
@@ -233,10 +214,10 @@ struct LogcatView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 10) {
-                Label("Logcat", systemImage: "doc.text.magnifyingglass")
-                    .font(.title3.weight(.semibold))
-                Spacer()
+            SheetHeader(title: "Logcat",
+                        subtitle: model.isLogcatRunning ? "Live stream" : "Paused",
+                        icon: "doc.text.magnifyingglass",
+                        tint: model.accent) {
                 Button {
                     model.isLogcatRunning ? model.stopLogcat() : model.startLogcat()
                 } label: {
@@ -253,14 +234,12 @@ struct LogcatView: View {
                 }
                 .keyboardShortcut(.defaultAction)
             }
-            .padding(14)
-            .background(.bar)
 
             HStack(spacing: 10) {
-                Image(systemName: "line.3.horizontal.decrease.circle")
-                    .foregroundStyle(model.logcatFilter.isEmpty ? .secondary : model.accent)
-                TextField("Filter logs", text: $model.logcatFilter)
-                    .textFieldStyle(.roundedBorder)
+                SearchPillField(icon: "line.3.horizontal.decrease.circle",
+                                placeholder: "Filter logs",
+                                text: $model.logcatFilter,
+                                tint: model.accent)
                 Picker("Level", selection: $model.logcatLevel) {
                     ForEach(levels, id: \.self) { Text($0).tag($0) }
                 }
@@ -279,11 +258,12 @@ struct LogcatView: View {
             ScrollViewReader { proxy in
                 ZStack {
                     if model.filteredLogcatLines.isEmpty {
-                        ContentUnavailableView {
-                            Label("No Logs", systemImage: "doc.text.magnifyingglass")
-                        } description: {
-                            Text(model.isLogcatRunning ? "Waiting for matching live log entries." : "Logcat is paused.")
-                        }
+                        EmptyStateView(
+                            icon: "doc.text.magnifyingglass",
+                            title: "No Logs",
+                            message: model.isLogcatRunning ? "Waiting for matching live log entries." : "Logcat is paused.",
+                            tint: model.accent
+                        )
                     } else {
                         ScrollView {
                             LazyVStack(alignment: .leading, spacing: 1) {
@@ -337,10 +317,7 @@ struct ApkManagerView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 10) {
-                Label("APK Manager", systemImage: "shippingbox")
-                    .font(.title3.weight(.semibold))
-                Spacer()
+            SheetHeader(title: "APK Manager", icon: "shippingbox", tint: model.accent) {
                 Button { model.installApkViaPanel() } label: {
                     Label("Install APK…", systemImage: "plus")
                 }
@@ -352,14 +329,11 @@ struct ApkManagerView: View {
                 Button("Done") { dismiss() }
                     .keyboardShortcut(.defaultAction)
             }
-            .padding(14)
-            .background(.bar)
 
             HStack(spacing: 10) {
-                Image(systemName: "magnifyingglass")
-                    .foregroundStyle(model.packageFilter.isEmpty ? .secondary : model.accent)
-                TextField("Filter packages", text: $model.packageFilter)
-                    .textFieldStyle(.roundedBorder)
+                SearchPillField(placeholder: "Filter packages",
+                                text: $model.packageFilter,
+                                tint: model.accent)
                 Toggle("Third-party only", isOn: $model.packageScopeThirdPartyOnly)
                     .onChange(of: model.packageScopeThirdPartyOnly) { _, _ in model.loadPackages() }
                 if model.isLoadingPackages {
@@ -385,19 +359,21 @@ struct ApkManagerView: View {
 
             ZStack {
                 if model.isLoadingPackages && model.packages.isEmpty {
-                    ContentUnavailableView {
-                        Label("Loading Apps", systemImage: "shippingbox")
-                    } description: {
-                        Text("Reading installed packages from the device.")
-                    } actions: {
+                    EmptyStateView(
+                        icon: "shippingbox",
+                        title: "Loading Apps",
+                        message: "Reading installed packages from the device.",
+                        tint: model.accent
+                    ) {
                         ProgressView().controlSize(.small)
                     }
                 } else if model.filteredPackages.isEmpty {
-                    ContentUnavailableView {
-                        Label("No Apps", systemImage: "app.dashed")
-                    } description: {
-                        Text(model.packageFilter.isEmpty ? "No packages matched this scope." : "No packages match this filter.")
-                    }
+                    EmptyStateView(
+                        icon: "app.dashed",
+                        title: "No Apps",
+                        message: model.packageFilter.isEmpty ? "No packages matched this scope." : "No packages match this filter.",
+                        tint: model.accent
+                    )
                 } else {
                     List(model.filteredPackages) { package in
                         PackageRowView(model: model, package: package) { action in
@@ -529,8 +505,8 @@ private struct PackageRowView: View {
         .padding(.horizontal, 8)
         .padding(.vertical, 5)
         .background(
-            RoundedRectangle(cornerRadius: 7)
-                .fill(hovering ? model.accent.opacity(0.08) : Color.clear)
+            RoundedRectangle(cornerRadius: DS.corner, style: .continuous)
+                .fill(hovering ? model.accent.opacity(DS.tonalFaint) : Color.clear)
         )
         .contentShape(Rectangle())
         .onHover { hovering = $0 }

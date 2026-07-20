@@ -55,16 +55,32 @@ struct FileGridView: View {
     }
 
     private func cell(_ file: RemoteFile) -> some View {
+        GridCell(file: file, model: model, compact: compact, thumbSide: thumbSide)
+    }
+}
+
+private struct GridCell: View {
+    let file: RemoteFile
+    @ObservedObject var model: BrowserViewModel
+    let compact: Bool
+    let thumbSide: CGFloat
+
+    @State private var hovering = false
+
+    var body: some View {
         let isSelected = model.selection.contains(file.id)
-        return VStack(spacing: compact ? 4 : 6) {
+        VStack(spacing: compact ? 4 : 6) {
             ZStack {
                 if !ThumbnailStore.canThumbnail(file) {
-                    RoundedRectangle(cornerRadius: 10)
-                        .fill(.quaternary.opacity(0.5))
+                    RoundedRectangle(cornerRadius: DS.corner, style: .continuous)
+                        .fill(file.isDirectory
+                              ? model.accent.opacity(DS.tonalFaint)
+                              : Color.secondary.opacity(0.07))
                 }
                 FileThumbView(file: file, model: model, side: thumbSide)
             }
             .frame(width: thumbSide, height: thumbSide)
+            .scaleEffect(hovering && !isSelected ? 1.03 : 1)
 
             Text(file.name)
                 .font(compact ? .caption2 : .caption)
@@ -72,18 +88,23 @@ struct FileGridView: View {
                 .multilineTextAlignment(.center)
                 .truncationMode(.middle)
                 .foregroundStyle(isSelected ? model.accent : Color.primary)
+                .fontWeight(isSelected ? .medium : .regular)
         }
         .padding(compact ? 5 : 8)
         .frame(maxWidth: .infinity)
         .background(
-            RoundedRectangle(cornerRadius: 12)
-                .fill(isSelected ? model.accent.opacity(0.14) : Color.clear)
+            RoundedRectangle(cornerRadius: DS.cornerLarge, style: .continuous)
+                .fill(isSelected
+                      ? model.accent.opacity(DS.tonal)
+                      : hovering ? Color.secondary.opacity(0.08) : Color.clear)
         )
         .overlay(
-            RoundedRectangle(cornerRadius: 12)
-                .strokeBorder(isSelected ? model.accent.opacity(0.6) : Color.clear, lineWidth: 1.5)
+            RoundedRectangle(cornerRadius: DS.cornerLarge, style: .continuous)
+                .strokeBorder(isSelected ? model.accent.opacity(0.55) : Color.clear, lineWidth: 1.5)
         )
         .contentShape(Rectangle())
+        .onHover { hovering = $0 }
+        .animation(.easeOut(duration: 0.13), value: hovering)
         .draggable(file)
         .gesture(TapGesture(count: 2).onEnded { model.activate(file) })
         .simultaneousGesture(TapGesture().onEnded {

@@ -29,9 +29,9 @@ struct DeviceSidebarView: View {
                     }
                     .buttonStyle(.plain)
                     .listRowBackground(
-                        RoundedRectangle(cornerRadius: 6)
-                            .fill(isCurrent ? model.accent.opacity(0.22) : Color.clear)
-                            .padding(.horizontal, 6)
+                        Capsule(style: .continuous)
+                            .fill(isCurrent ? model.accent.opacity(DS.tonalStrong) : Color.clear)
+                            .padding(.horizontal, 4)
                     )
                 }
             }
@@ -64,9 +64,9 @@ struct DeviceSidebarView: View {
                             }
                         }
                         .listRowBackground(
-                            RoundedRectangle(cornerRadius: 6)
-                                .fill(isCurrent ? model.accent.opacity(0.22) : Color.clear)
-                                .padding(.horizontal, 6)
+                            Capsule(style: .continuous)
+                                .fill(isCurrent ? model.accent.opacity(DS.tonalStrong) : Color.clear)
+                                .padding(.horizontal, 4)
                         )
                         .help(bookmark.path)
                     }
@@ -78,23 +78,41 @@ struct DeviceSidebarView: View {
 
     // MARK: - Live device card
 
+    private var selectedDevice: DeviceInfo? {
+        model.devices.first(where: { $0.serial == model.selectedSerial })
+    }
+
     private var deviceCard: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            HStack(spacing: 8) {
+        VStack(alignment: .leading, spacing: 11) {
+            HStack(spacing: 10) {
                 Image(systemName: "iphone.gen3")
+                    .font(.system(size: 17, weight: .medium))
                     .foregroundStyle(model.accent)
-                if let device = model.devices.first(where: { $0.serial == model.selectedSerial }) {
-                    Text(device.model.replacingOccurrences(of: "_", with: " "))
-                        .font(.headline)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
+                    .frame(width: 34, height: 34)
+                    .background(
+                        Circle().fill(model.accent.opacity(DS.tonal))
+                    )
+                VStack(alignment: .leading, spacing: 1) {
+                    if let device = selectedDevice {
+                        Text(device.model.replacingOccurrences(of: "_", with: " "))
+                            .font(.subheadline.weight(.semibold))
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                        Text(device.isWireless ? "Wireless debugging" : "USB debugging")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text("No device")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                    }
                 }
-                Spacer()
+                Spacer(minLength: 0)
             }
 
-            VStack(alignment: .leading, spacing: 5) {
-                if let device = model.devices.first(where: { $0.serial == model.selectedSerial }) {
-                    healthChip(title: device.isWireless ? "Wi-Fi ADB" : "USB ADB",
+            FlowChips {
+                if let device = selectedDevice {
+                    healthChip(title: device.isWireless ? "Wi-Fi" : "USB",
                                icon: device.transportIcon,
                                tint: device.isWireless ? .blue : .green)
                         .help(device.transportName)
@@ -112,10 +130,17 @@ struct DeviceSidebarView: View {
             }
 
             if let used = model.deviceStatus.usedFraction, let text = model.deviceStatus.storageText {
-                VStack(alignment: .leading, spacing: 3) {
-                    ProgressView(value: used)
-                        .tint(model.accent)
-                        .controlSize(.small)
+                VStack(alignment: .leading, spacing: 4) {
+                    GeometryReader { geo in
+                        ZStack(alignment: .leading) {
+                            Capsule().fill(model.accent.opacity(DS.tonal))
+                            Capsule()
+                                .fill(model.accent)
+                                .frame(width: max(6, geo.size.width * used))
+                        }
+                    }
+                    .frame(height: 6)
+                    .animation(.easeOut(duration: 0.4), value: used)
                     Text(text)
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -123,32 +148,68 @@ struct DeviceSidebarView: View {
             }
 
             if let theme = model.theme {
-                HStack(spacing: 6) {
+                HStack(spacing: 5) {
                     ForEach(Array(theme.stops.enumerated()), id: \.offset) { _, stop in
-                        RoundedRectangle(cornerRadius: 4.5)
+                        Circle()
                             .fill(stop)
-                            .frame(width: 16, height: 16)
-                            .overlay(RoundedRectangle(cornerRadius: 4.5).strokeBorder(.quaternary, lineWidth: 0.5))
+                            .frame(width: 13, height: 13)
+                            .overlay(Circle().strokeBorder(.quaternary, lineWidth: 0.5))
                     }
+                    Spacer(minLength: 0)
                 }
+                .help("Material You palette from the phone's wallpaper")
             }
         }
-        .padding(10)
+        .padding(12)
         .background(
-            RoundedRectangle(cornerRadius: 10)
-                .fill(.quaternary.opacity(0.4))
+            RoundedRectangle(cornerRadius: DS.cornerLarge, style: .continuous)
+                .fill(cardGradient)
         )
+        .overlay(
+            RoundedRectangle(cornerRadius: DS.cornerLarge, style: .continuous)
+                .strokeBorder(model.accent.opacity(0.14), lineWidth: 1)
+        )
+    }
+
+    /// Subtle wallpaper-derived wash; falls back to a plain tonal surface.
+    private var cardGradient: AnyShapeStyle {
+        if let theme = model.theme, theme.stops.count >= 2 {
+            return AnyShapeStyle(
+                LinearGradient(
+                    colors: [
+                        theme.stops[0].opacity(0.16),
+                        theme.stops[theme.stops.count - 1].opacity(0.10),
+                    ],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+            )
+        }
+        return AnyShapeStyle(model.accent.opacity(DS.tonalFaint))
     }
 
     private func healthChip(title: String, icon: String, tint: Color) -> some View {
         Label(title, systemImage: icon)
             .font(.caption.weight(.semibold))
             .labelStyle(.titleAndIcon)
-            .padding(.horizontal, 7)
-            .padding(.vertical, 3)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Capsule().fill(tint.opacity(0.14)))
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3.5)
+            .background(Capsule(style: .continuous).fill(tint.opacity(DS.tonal)))
             .foregroundStyle(tint)
+            .lineLimit(1)
+            .fixedSize()
+    }
+}
+
+/// Lays chips out in wrapping rows.
+private struct FlowChips<Content: View>: View {
+    @ViewBuilder var content: () -> Content
+
+    var body: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 5) { content() }
+            VStack(alignment: .leading, spacing: 5) { content() }
+        }
     }
 }
 

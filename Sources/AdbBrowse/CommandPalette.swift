@@ -70,9 +70,10 @@ struct CommandPaletteView: View {
             }
         }
         .frame(width: 580)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
-        .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(.quaternary, lineWidth: 1))
-        .shadow(color: .black.opacity(0.3), radius: 28, y: 10)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: DS.cornerXL, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: DS.cornerXL, style: .continuous)
+            .strokeBorder(.quaternary, lineWidth: 1))
+        .shadow(color: .black.opacity(0.28), radius: 32, y: 12)
         .onAppear { fieldFocused = true }
         .onChange(of: query) {
             selectedIndex = 0
@@ -83,8 +84,13 @@ struct CommandPaletteView: View {
     private func row(_ item: PaletteItem, isSelected: Bool) -> some View {
         HStack(spacing: 10) {
             Image(systemName: item.icon)
-                .frame(width: 20)
+                .font(.system(size: 13, weight: .medium))
                 .foregroundStyle(isSelected ? model.accent : .secondary)
+                .frame(width: 26, height: 26)
+                .background(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(isSelected ? model.accent.opacity(DS.tonal) : Color.secondary.opacity(0.08))
+                )
             VStack(alignment: .leading, spacing: 1) {
                 Text(item.title).lineLimit(1)
                 if let subtitle = item.subtitle {
@@ -97,14 +103,15 @@ struct CommandPaletteView: View {
             }
             Spacer()
             if let hint = item.hint {
-                Text(hint)
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
+                KeycapHint(text: hint)
             }
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
-        .background(RoundedRectangle(cornerRadius: 8).fill(isSelected ? model.accent.opacity(0.16) : Color.clear))
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background(
+            RoundedRectangle(cornerRadius: DS.corner, style: .continuous)
+                .fill(isSelected ? model.accent.opacity(DS.tonal) : Color.clear)
+        )
         .contentShape(Rectangle())
     }
 

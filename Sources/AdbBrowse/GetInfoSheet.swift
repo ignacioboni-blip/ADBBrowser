@@ -27,17 +27,15 @@ struct GetInfoSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 10) {
-                Image(systemName: file.icon)
-                    .font(.system(size: 28))
-                    .foregroundStyle(model.accent)
+            HStack(spacing: 12) {
+                TonalIconBadge(icon: file.icon, tint: model.accent, side: 44)
                 VStack(alignment: .leading, spacing: 1) {
                     Text(file.name).font(.headline).lineLimit(2)
                     Text(kindLabel).font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
             }
-            .padding(.bottom, 12)
+            .padding(.bottom, 14)
 
             Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 12, verticalSpacing: 8) {
                 infoRow("Path") {
