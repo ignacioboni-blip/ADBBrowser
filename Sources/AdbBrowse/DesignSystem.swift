@@ -203,11 +203,10 @@ struct EmptyStateView<Actions: View>: View {
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 380)
-                .fixedSize(horizontal: false, vertical: true)
                 .padding(.bottom, 18)
             HStack(spacing: 10) { actions() }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(24)
+        .frame(maxHeight: .infinity)
     }
 }
