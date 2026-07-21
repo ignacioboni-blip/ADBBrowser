@@ -110,25 +110,12 @@ struct DeviceSidebarView: View {
                 Spacer(minLength: 0)
             }
 
-            FlowChips {
-                if let device = selectedDevice {
-                    healthChip(title: device.isWireless ? "Wi-Fi" : "USB",
-                               icon: device.transportIcon,
-                               tint: device.isWireless ? .blue : .green)
-                        .help(device.transportName)
-                }
-                if let level = model.deviceStatus.batteryLevel {
-                    healthChip(title: "\(level)%",
-                               icon: model.deviceStatus.isCharging ? "bolt.fill" : model.deviceStatus.batteryIcon,
-                               tint: model.deviceStatus.isCharging ? model.accent : .secondary)
-                }
-                if model.rootMode != .unknown {
-                    healthChip(title: model.rootMode.badge,
-                               icon: model.suAvailable ? "lock.open.fill" : "lock",
-                               tint: model.suAvailable ? .orange : .secondary)
-                }
+            let hasChips = selectedDevice != nil
+                || model.deviceStatus.batteryLevel != nil
+                || model.rootMode != .unknown
+            if hasChips {
+                chipRow
             }
-
             if let used = model.deviceStatus.usedFraction, let text = model.deviceStatus.storageText {
                 VStack(alignment: .leading, spacing: 4) {
                     GeometryReader { geo in
@@ -188,6 +175,29 @@ struct DeviceSidebarView: View {
         return AnyShapeStyle(model.accent.opacity(DS.tonalFaint))
     }
 
+    /// Compact status chips; plain HStack — ViewThatFits breaks List layout here.
+    private var chipRow: some View {
+        HStack(spacing: 5) {
+            if let device = selectedDevice {
+                healthChip(title: device.isWireless ? "Wi-Fi" : "USB",
+                           icon: device.transportIcon,
+                           tint: device.isWireless ? .blue : .green)
+                    .help(device.transportName)
+            }
+            if let level = model.deviceStatus.batteryLevel {
+                healthChip(title: "\(level)%",
+                           icon: model.deviceStatus.isCharging ? "bolt.fill" : model.deviceStatus.batteryIcon,
+                           tint: model.deviceStatus.isCharging ? model.accent : .secondary)
+            }
+            if model.rootMode != .unknown {
+                healthChip(title: model.rootMode.badge,
+                           icon: model.suAvailable ? "lock.open.fill" : "lock",
+                           tint: model.suAvailable ? .orange : .secondary)
+            }
+            Spacer(minLength: 0)
+        }
+    }
+
     private func healthChip(title: String, icon: String, tint: Color) -> some View {
         Label(title, systemImage: icon)
             .font(.caption.weight(.semibold))
@@ -198,18 +208,6 @@ struct DeviceSidebarView: View {
             .foregroundStyle(tint)
             .lineLimit(1)
             .fixedSize()
-    }
-}
-
-/// Lays chips out in wrapping rows.
-private struct FlowChips<Content: View>: View {
-    @ViewBuilder var content: () -> Content
-
-    var body: some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(spacing: 5) { content() }
-            VStack(alignment: .leading, spacing: 5) { content() }
-        }
     }
 }
 
